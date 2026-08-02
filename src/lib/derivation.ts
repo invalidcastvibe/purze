@@ -11,8 +11,8 @@ export const DERIVATION_PATHS: Record<PresetDerivationPathType, { parent: string
     full: "m/44'/0'/0'/0/0",
   },
   zapit: {
-    parent: "m/44'/145'/1'",
-    full: "m/44'/145'/1'/0/0",
+    parent: "m/44'/245'/0'",
+    full: "m/44'/245'/0'/0/0",
   },
 };
 
