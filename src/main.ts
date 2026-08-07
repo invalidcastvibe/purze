@@ -23,6 +23,8 @@ import {
 	faStar,
 	faEye,
 	faEyeSlash,
+	faBell,
+	faUser,
 } from '@fortawesome/free-solid-svg-icons';
 
 library.add(
@@ -46,6 +48,8 @@ library.add(
 	faStar,
 	faEye,
 	faEyeSlash,
+	faBell,
+	faUser,
 );
 
 const app = createApp(App);

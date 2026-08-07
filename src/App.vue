@@ -77,6 +77,25 @@ type PendingWcConnectionProposal = {
   appIcon?: string;
 };
 
+type NotificationSettingKey = 'sendFunds' | 'receiveFunds' | 'walletConnectApproval';
+
+type NotificationItem = {
+  id: string;
+  label: string;
+  icon: string;
+  settingKey: NotificationSettingKey;
+};
+
+type NotificationEventItem = {
+  id: string;
+  type: NotificationSettingKey;
+  label: string;
+  icon: string;
+  message: string;
+  createdAt: number;
+  read: boolean;
+};
+
 type TokenHistoryItem = {
   hash: string;
   timestamp?: number;
@@ -129,6 +148,8 @@ const TOKEN_NAME_CACHE_STORAGE_KEY = 'slim.tokenNameCache.v2';
 const USD_RATE_CACHE_STORAGE_KEY = 'slim.usdRateCache.v1';
 const HIDDEN_TOKEN_CATEGORIES_STORAGE_KEY = 'slim.hiddenTokenCategories.v1';
 const FAVORITE_TOKEN_CATEGORIES_STORAGE_KEY = 'slim.favoriteTokenCategories.v1';
+const NOTIFICATION_SETTINGS_STORAGE_KEY = 'slim.notificationSettings.v1';
+const NOTIFICATION_EVENTS_STORAGE_KEY = 'slim.notificationEvents.v1';
 const IPFS_GATEWAY = 'https://dweb.link/ipfs/';
 const MAX_TOKEN_NAME_CACHE_ENTRIES = 350;
 const USD_RATE_CACHE_TTL_DESKTOP_MS = 2 * 60 * 1000;
@@ -158,7 +179,6 @@ const showSeedPhrase = ref(false);
 const derivationUpdateType = ref<DerivationPathType>('standard');
 const customDerivationPathUpdate = ref('');
 const isUpdatingDerivation = ref(false);
-const showActiveDerivationEditor = ref(false);
 const actionSheetWalletName = ref<string | null>(null);
 const manageWalletDetails = ref<ManageWalletDetails | null>(null);
 const loadingManageWalletDetails = ref(false);
@@ -204,6 +224,18 @@ const copiedTokenId = ref<string | null>(null);
 const failedAssetIcons = ref<Record<string, true>>({});
 const failedIconUris = ref<Record<string, true>>({});
 let copiedTokenTimer: ReturnType<typeof setTimeout> | null = null;
+const notificationMenuOpen = ref(false);
+const notificationMenuEl = ref<HTMLElement | null>(null);
+const notificationSettings = ref<Record<NotificationSettingKey, boolean>>({
+  sendFunds: true,
+  receiveFunds: true,
+  walletConnectApproval: true,
+});
+const notificationEvents = ref<NotificationEventItem[]>([]);
+const previousBchBalance = ref<bigint | null>(null);
+const previousTokenTotals = ref<Record<string, bigint>>({});
+const hasNotificationBalanceBaseline = ref(false);
+const walletModalView = ref<'wallets' | 'notifications'>('wallets');
 
 const wcUri = ref('');
 const walletKit = ref<IWalletKit | null>(null);
@@ -369,6 +401,128 @@ const selectedBchSendHistory = computed<BchSendHistoryRow[]>(() => tokenSendHist
   })
   .filter((item): item is BchSendHistoryRow => item !== null)
   .slice(0, 10));
+const allNotificationItems: NotificationItem[] = [
+  { id: 'send-funds', label: 'Send funds', icon: 'paper-plane', settingKey: 'sendFunds' },
+  { id: 'receive-funds', label: 'Receive funds', icon: 'wallet', settingKey: 'receiveFunds' },
+  { id: 'wallet-connect-approval', label: 'Wallet connect approval', icon: 'link', settingKey: 'walletConnectApproval' },
+];
+const hasEnabledNotificationTypes = computed(() => Object.values(notificationSettings.value).some(Boolean));
+const notificationItems = computed(() => notificationEvents.value.filter((item) => notificationSettings.value[item.type] && !item.read));
+const notificationCount = computed(() => notificationItems.value.length);
+const notificationUnreadIds = computed(() => new Set(notificationItems.value.map((item) => item.id)));
+
+function pushNotification(type: NotificationSettingKey, message: string) {
+  const definition = allNotificationItems.find((item) => item.settingKey === type);
+  if (!definition) return;
+  if (!notificationSettings.value[type]) return;
+
+  const entry: NotificationEventItem = {
+    id: `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+    type,
+    label: definition.label,
+    icon: definition.icon,
+    message,
+    createdAt: Date.now(),
+    read: false,
+  };
+
+  notificationEvents.value = [entry, ...notificationEvents.value].slice(0, 60);
+}
+
+function persistNotificationEvents() {
+  localStorage.setItem(NOTIFICATION_EVENTS_STORAGE_KEY, JSON.stringify(notificationEvents.value));
+}
+
+function persistNotificationSettings() {
+  localStorage.setItem(NOTIFICATION_SETTINGS_STORAGE_KEY, JSON.stringify(notificationSettings.value));
+}
+
+function setNotificationSetting(settingKey: NotificationSettingKey, enabled: boolean) {
+  notificationSettings.value = {
+    ...notificationSettings.value,
+    [settingKey]: enabled,
+  };
+  persistNotificationSettings();
+}
+
+function onNotificationSettingToggle(settingKey: NotificationSettingKey, event: Event) {
+  const target = event.target;
+  if (!(target instanceof HTMLInputElement)) return;
+  setNotificationSetting(settingKey, target.checked);
+}
+
+async function ensureBrowserNotificationPermission() {
+  if (typeof window === 'undefined') return;
+  if (!('Notification' in window)) {
+    status.value = 'This browser does not support notifications';
+    return;
+  }
+  if (!window.isSecureContext) {
+    status.value = 'Notifications require HTTPS (or localhost)';
+    return;
+  }
+
+  if (Notification.permission === 'granted') {
+    return;
+  }
+
+  if (Notification.permission === 'denied') {
+    status.value = 'Notifications are blocked. Enable them in browser settings.';
+    return;
+  }
+
+  try {
+    const permission = await Notification.requestPermission();
+    if (permission === 'granted') {
+      status.value = 'Notifications enabled';
+      return;
+    }
+    if (permission === 'denied') {
+      status.value = 'Notification permission denied';
+      return;
+    }
+    status.value = 'Notification permission dismissed';
+  } catch {
+    status.value = 'Unable to request notification permission';
+  }
+}
+
+function toggleNotificationMenu() {
+  notificationMenuOpen.value = !notificationMenuOpen.value;
+  if (notificationMenuOpen.value && notificationCount.value > 0) {
+    void ensureBrowserNotificationPermission();
+  }
+}
+
+function closeNotificationMenu() {
+  notificationMenuOpen.value = false;
+}
+
+function handleNotificationClick(item: NotificationEventItem) {
+  notificationEvents.value = notificationEvents.value.map((eventItem) =>
+    eventItem.id === item.id ? { ...eventItem, read: true } : eventItem,
+  );
+  status.value = `${item.label}: ${item.message}`;
+  closeNotificationMenu();
+}
+
+function markAllNotificationsRead() {
+  const unreadIds = notificationUnreadIds.value;
+  if (unreadIds.size === 0) return;
+  notificationEvents.value = notificationEvents.value.map((eventItem) =>
+    unreadIds.has(eventItem.id) ? { ...eventItem, read: true } : eventItem,
+  );
+  status.value = 'All notifications marked as read';
+}
+
+function onDocumentClick(event: MouseEvent) {
+  if (!notificationMenuOpen.value) return;
+  const target = event.target;
+  if (!(target instanceof Node)) return;
+  if (!notificationMenuEl.value?.contains(target)) {
+    closeNotificationMenu();
+  }
+}
 
 function onSendModeChange(value: string) {
   sendMode.value = value === 'token' ? 'token' : 'bch';
@@ -386,7 +540,12 @@ function onReceiveAddressTypeChange(value: string) {
 }
 
 function openWalletListModal() {
+  walletModalView.value = 'wallets';
   activeOverlayScreen.value = 'wallet-list';
+}
+
+function setWalletModalView(view: 'wallets' | 'notifications') {
+  walletModalView.value = view;
 }
 
 function closeWalletListModal() {
@@ -567,6 +726,12 @@ function formatHistoryTimestamp(timestamp?: number, blockHeight?: number): strin
   return `${date.toLocaleDateString()} ${date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
 }
 
+function formatNotificationTime(createdAt: number): string {
+  const date = new Date(createdAt);
+  if (Number.isNaN(date.getTime())) return '';
+  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
 function openTokenHistoryTransaction(hash: string) {
   if (!hash) return;
   const url = `https://blockchair.com/bitcoin-cash/transaction/${hash}`;
@@ -622,6 +787,7 @@ async function sendBch() {
   try {
     const { txId } = await activeWallet.value.send([{ cashaddr, value: sats }]);
     status.value = txId ? `BCH sent. TxId: ${txId}` : 'BCH sent';
+    pushNotification('sendFunds', `You sent ${formatBchFromSats(sats)} BCH.`);
     resetSendForm();
     closeSendAssetModal();
     await refreshBalancesAndTokens();
@@ -670,6 +836,7 @@ async function sendCashToken() {
       }),
     ]);
     status.value = txId ? `CashToken sent. TxId: ${txId}` : 'CashToken sent';
+    pushNotification('sendFunds', `You sent ${formatTokenAmount(amount, selectedToken.decimals)} ${selectedToken.symbol ?? selectedToken.displayName}.`);
     resetSendForm();
     closeSendAssetModal();
     await refreshBalancesAndTokens();
@@ -691,56 +858,6 @@ async function sendFunds() {
 
 function fallbackTokenName(category: string): string {
   return `Token ${category.slice(0, 8)}`;
-}
-
-function loadPersistedClientCaches() {
-  try {
-    const rawTokenCache = localStorage.getItem(TOKEN_NAME_CACHE_STORAGE_KEY);
-    if (rawTokenCache) {
-      const parsed = JSON.parse(rawTokenCache) as Record<string, TokenMetadata>;
-      if (parsed && typeof parsed === 'object') {
-        tokenNameCache.value = parsed;
-      }
-    }
-  } catch {
-    tokenNameCache.value = {};
-  }
-
-  try {
-    const rawUsdRateCache = localStorage.getItem(USD_RATE_CACHE_STORAGE_KEY);
-    if (rawUsdRateCache) {
-      const parsed = JSON.parse(rawUsdRateCache) as UsdRateCache;
-      if (typeof parsed?.rate === 'number' && typeof parsed?.updatedAt === 'number') {
-        usdRateCache.value = parsed;
-      }
-    }
-  } catch {
-    usdRateCache.value = null;
-  }
-
-  try {
-    const rawHiddenCategories = localStorage.getItem(HIDDEN_TOKEN_CATEGORIES_STORAGE_KEY);
-    if (rawHiddenCategories) {
-      const parsed = JSON.parse(rawHiddenCategories) as string[];
-      if (Array.isArray(parsed)) {
-        hiddenTokenCategories.value = Object.fromEntries(parsed.filter((value) => typeof value === 'string').map((value) => [value, true]));
-      }
-    }
-  } catch {
-    hiddenTokenCategories.value = {};
-  }
-
-  try {
-    const rawFavoriteCategories = localStorage.getItem(FAVORITE_TOKEN_CATEGORIES_STORAGE_KEY);
-    if (rawFavoriteCategories) {
-      const parsed = JSON.parse(rawFavoriteCategories) as string[];
-      if (Array.isArray(parsed)) {
-        favoriteTokenCategories.value = Object.fromEntries(parsed.filter((value) => typeof value === 'string').map((value) => [value, true]));
-      }
-    }
-  } catch {
-    favoriteTokenCategories.value = {};
-  }
 }
 
 function persistTokenNameCache() {
@@ -981,6 +1098,103 @@ function formatUsdCompact(value: number | null): string {
   return value.toLocaleString(undefined, { style: 'currency', currency: 'USD', maximumFractionDigits: 2 });
 }
 
+function loadPersistedClientCaches() {
+  try {
+    const rawTokenCache = localStorage.getItem(TOKEN_NAME_CACHE_STORAGE_KEY);
+    if (rawTokenCache) {
+      const parsed = JSON.parse(rawTokenCache) as Record<string, TokenMetadata>;
+      if (parsed && typeof parsed === 'object') {
+        tokenNameCache.value = parsed;
+      }
+    }
+  } catch {
+    tokenNameCache.value = {};
+  }
+
+  try {
+    const rawUsdRateCache = localStorage.getItem(USD_RATE_CACHE_STORAGE_KEY);
+    if (rawUsdRateCache) {
+      const parsed = JSON.parse(rawUsdRateCache) as UsdRateCache;
+      if (typeof parsed?.rate === 'number' && typeof parsed?.updatedAt === 'number') {
+        usdRateCache.value = parsed;
+      }
+    }
+  } catch {
+    usdRateCache.value = null;
+  }
+
+  try {
+    const rawHiddenCategories = localStorage.getItem(HIDDEN_TOKEN_CATEGORIES_STORAGE_KEY);
+    if (rawHiddenCategories) {
+      const parsed = JSON.parse(rawHiddenCategories) as string[];
+      if (Array.isArray(parsed)) {
+        hiddenTokenCategories.value = Object.fromEntries(parsed.filter((value) => typeof value === 'string').map((value) => [value, true]));
+      }
+    }
+  } catch {
+    hiddenTokenCategories.value = {};
+  }
+
+  try {
+    const rawFavoriteCategories = localStorage.getItem(FAVORITE_TOKEN_CATEGORIES_STORAGE_KEY);
+    if (rawFavoriteCategories) {
+      const parsed = JSON.parse(rawFavoriteCategories) as string[];
+      if (Array.isArray(parsed)) {
+        favoriteTokenCategories.value = Object.fromEntries(parsed.filter((value) => typeof value === 'string').map((value) => [value, true]));
+      }
+    }
+  } catch {
+    favoriteTokenCategories.value = {};
+  }
+
+  try {
+    const rawNotificationSettings = localStorage.getItem(NOTIFICATION_SETTINGS_STORAGE_KEY);
+    if (rawNotificationSettings) {
+      const parsed = JSON.parse(rawNotificationSettings) as Partial<Record<NotificationSettingKey, boolean>>;
+      notificationSettings.value = {
+        sendFunds: parsed.sendFunds !== false,
+        receiveFunds: parsed.receiveFunds !== false,
+        walletConnectApproval: parsed.walletConnectApproval !== false,
+      };
+    }
+  } catch {
+    notificationSettings.value = {
+      sendFunds: true,
+      receiveFunds: true,
+      walletConnectApproval: true,
+    };
+  }
+
+  try {
+    const rawNotificationEvents = localStorage.getItem(NOTIFICATION_EVENTS_STORAGE_KEY);
+    if (rawNotificationEvents) {
+      const parsed = JSON.parse(rawNotificationEvents) as NotificationEventItem[];
+      if (Array.isArray(parsed)) {
+        notificationEvents.value = parsed
+          .filter((eventItem) =>
+            eventItem &&
+            typeof eventItem.id === 'string' &&
+            (eventItem.type === 'sendFunds' || eventItem.type === 'receiveFunds' || eventItem.type === 'walletConnectApproval') &&
+            typeof eventItem.label === 'string' &&
+            typeof eventItem.message === 'string' &&
+            typeof eventItem.icon === 'string' &&
+            typeof eventItem.createdAt === 'number' &&
+            typeof eventItem.read === 'boolean',
+          )
+          .slice(0, 60);
+      }
+    }
+  } catch {
+    notificationEvents.value = [];
+  }
+}
+
+function resetNotificationBalanceBaseline() {
+  previousBchBalance.value = null;
+  previousTokenTotals.value = {};
+  hasNotificationBalanceBaseline.value = false;
+}
+
 function saveWallets() {
   localStorage.setItem('slim.wallets', JSON.stringify(wallets.value));
   localStorage.setItem('slim.activeWalletName', activeWalletName.value);
@@ -1125,8 +1339,8 @@ async function loadActiveWallet(name: string) {
   tokenWalletAddress.value = wallet.getTokenDepositAddress();
   showSeedPhrase.value = false;
   managerMode.value = 'none';
-  showActiveDerivationEditor.value = false;
   syncDerivationEditorFromActiveWallet();
+  resetNotificationBalanceBaseline();
   await refreshBalancesAndTokens();
   await syncSessionAddresses();
   saveWallets();
@@ -1281,19 +1495,6 @@ async function openManageBackup() {
   if (!ok) return;
   showSeedPhrase.value = false;
   manageModalMode.value = 'backup';
-}
-
-function toggleActiveWalletDerivationEditor() {
-  if (!activeWalletName.value || !activeWallet.value) {
-    status.value = 'No active wallet selected';
-    return;
-  }
-
-  if (!showActiveDerivationEditor.value) {
-    syncDerivationEditorFromActiveWallet();
-  }
-
-  showActiveDerivationEditor.value = !showActiveDerivationEditor.value;
 }
 
 async function deleteWalletFromDb(name: string, dbName: 'bitcoincash' | 'bchtest') {
@@ -1506,6 +1707,7 @@ async function updateActiveWalletDerivationPath() {
 
   const name = activeWalletName.value;
   const seed = activeSeedPhrase.value.trim().replace(/\s+/g, ' ');
+  status.value = 'Updating derivation and reloading wallet...';
   isUpdatingDerivation.value = true;
   try {
     if (activeWalletType.value === 'hd') {
@@ -1521,7 +1723,6 @@ async function updateActiveWalletDerivationPath() {
     await loadActiveWallet(name);
     await refreshBalancesAndTokens();
     closeWalletActionSheet();
-    showActiveDerivationEditor.value = false;
     status.value = 'Derivation path updated and wallet reloaded';
   } catch (error) {
     status.value = error instanceof Error ? error.message : 'Failed to update derivation path';
@@ -1593,10 +1794,18 @@ async function createOrImportWallet() {
 
 async function refreshBalancesAndTokens() {
   if (!activeWallet.value) return;
+  const shouldEmitReceiveNotifications = hasNotificationBalanceBaseline.value;
   const utxos = await activeWallet.value.getUtxos();
-  bchBalance.value = utxos
+  const nextBchBalance = utxos
     .filter((u) => u.token === undefined)
     .reduce((sum, u) => sum + u.satoshis, 0n);
+  bchBalance.value = nextBchBalance;
+
+  if (shouldEmitReceiveNotifications && previousBchBalance.value !== null && nextBchBalance > previousBchBalance.value) {
+    const delta = nextBchBalance - previousBchBalance.value;
+    pushNotification('receiveFunds', `You received ${formatBchFromSats(delta)} BCH.`);
+  }
+  previousBchBalance.value = nextBchBalance;
 
   try {
     const oneBchInUsd = await getBchUsdRateWithCache();
@@ -1628,6 +1837,19 @@ async function refreshBalancesAndTokens() {
     tokenMap.set(category, existing);
   }
   const nextTokenList = [...tokenMap.values()];
+  const nextTokenTotals: Record<string, bigint> = Object.fromEntries(nextTokenList.map((token) => [token.category, token.fungibleAmount]));
+  if (shouldEmitReceiveNotifications) {
+    for (const token of nextTokenList) {
+      const previousAmount = previousTokenTotals.value[token.category] ?? 0n;
+      if (token.fungibleAmount > previousAmount) {
+        const delta = token.fungibleAmount - previousAmount;
+        const amountText = formatTokenAmount(delta, token.decimals);
+        pushNotification('receiveFunds', `You received ${amountText} ${token.symbol ?? token.displayName}.`);
+      }
+    }
+  }
+  previousTokenTotals.value = nextTokenTotals;
+  hasNotificationBalanceBaseline.value = true;
   tokenList.value = nextTokenList;
   failedAssetIcons.value = {};
   if (!sendableTokens.value.some((token) => token.category === sendTokenCategory.value)) {
@@ -1879,6 +2101,7 @@ async function initWalletConnect() {
         appUrl,
         appIcon,
       };
+      pushNotification('walletConnectApproval', `${appName} wants to connect to your wallet.`);
       activeOverlayScreen.value = 'wallet-connect';
       status.value = `Connection approval required for ${appName}`;
     });
@@ -1929,6 +2152,7 @@ onMounted(async () => {
   loadPersistedClientCaches();
   updateViewportState();
   window.addEventListener('resize', updateViewportState);
+  document.addEventListener('click', onDocumentClick);
   loadWallets();
 
   try {
@@ -1983,8 +2207,13 @@ watch([tokenListCollapsed, isMobileView, tokenList], ([collapsed, isMobile, list
   void hydrateTokenNames(list);
 });
 
+watch(notificationEvents, () => {
+  persistNotificationEvents();
+}, { deep: true });
+
 onBeforeUnmount(() => {
   window.removeEventListener('resize', updateViewportState);
+  document.removeEventListener('click', onDocumentClick);
   document.body.style.overflow = '';
   document.documentElement.style.overflow = '';
   if (toastTimer) {
@@ -1994,7 +2223,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <main class="app-shell">
+  <main class="app-shell" :class="{ 'compact-mobile': mobileCompactMode }">
     <div class="topbar-simple">
       <div class="top-wallet-group" role="group" aria-label="Wallet actions">
         <button class="top-receive-btn" @click="openReceiveModal" title="Receive BCH" aria-label="Receive BCH">
@@ -2002,31 +2231,15 @@ onBeforeUnmount(() => {
         </button>
         <button class="top-wallet-btn" @click="openWalletListModal" title="Select Wallet" aria-label="Select Wallet">
           <span class="top-wallet-text">
-            <span class="top-wallet-caption">Select Wallet</span>
+            <span class="top-wallet-caption">My Purze</span>
             <span class="top-wallet-current">{{ currentWalletButtonLabel }}</span>
           </span>
-        </button>
-      </div>
-      <div class="top-quick-actions">
-        <button class="top-connect-btn top-refresh-btn" @click="refreshBalancesAndTokens" title="Refresh balances" aria-label="Refresh balances">
-          <FontAwesomeIcon :icon="['fas', 'rotate']" class="top-connect-icon" />
-        </button>
-        <button
-          class="top-connect-btn"
-          :class="{ 'wc-connected': hasActiveWcSessions }"
-          @click="openWalletConnectModal"
-          :title="hasActiveWcSessions ? 'WalletConnect connected' : 'WalletConnect'"
-          :aria-label="hasActiveWcSessions ? 'WalletConnect connected' : 'WalletConnect'"
-        >
-          <FontAwesomeIcon :icon="['fas', 'link']" class="top-connect-icon" />
-          <span v-if="hasActiveWcSessions" class="wc-connected-dot" aria-hidden="true"></span>
-          <span v-if="pendingWcRequests.length > 0" class="wc-pending-badge">{{ pendingWcRequests.length }}</span>
         </button>
       </div>
     </div>
 
     <div class="home-stack">
-      <section class="glass-card active-wallet-card" :class="{ 'dropdown-open': showActiveDerivationEditor }">
+      <section class="glass-card active-wallet-card">
         <div v-if="activeWallet" class="meta">
           <div class="address-grid">
             <article class="address-card address-card-bch">
@@ -2065,34 +2278,26 @@ onBeforeUnmount(() => {
           </div>
 
           <div class="active-derivation-row">
-            <div><strong>Derivation:</strong> {{ activeDerivationPath }}</div>
-            <button class="tiny-btn active-derivation-btn" @click="toggleActiveWalletDerivationEditor" :disabled="!activeSeedPhrase">
-              <FontAwesomeIcon :icon="['fas', showActiveDerivationEditor ? 'xmark' : 'rotate']" class="icon-btn" />{{ showActiveDerivationEditor ? 'Close' : 'Change' }}
-            </button>
+            <strong>Derivation:</strong>
+            <UiSelect
+              id="active-derivation-select"
+              class="active-derivation-inline-select"
+              :model-value="derivationUpdateType"
+              :options="derivationOptions"
+              @update:modelValue="onDerivationUpdateTypeChangeAndApply"
+            />
           </div>
-          <div class="active-derivation-editor" v-if="showActiveDerivationEditor">
-            <div class="row">
-              <label for="active-derivation-select">New Derivation Path</label>
-              <UiSelect
-                id="active-derivation-select"
-                :model-value="derivationUpdateType"
-                :options="derivationOptions"
-                @update:modelValue="onDerivationUpdateTypeChangeAndApply"
-              />
-            </div>
-            <div class="row" v-if="derivationUpdateType === 'custom'">
-              <label for="active-custom-derivation-input">Custom Path</label>
-              <input
-                id="active-custom-derivation-input"
-                v-model="customDerivationPathUpdate"
-                placeholder="m/44'/145'/0' or m/44'/145'/0'/0/0"
-                @change="applyCustomDerivationIfValid"
-                @keydown.enter.prevent="applyCustomDerivationIfValid"
-              />
-            </div>
-            <p class="hint" v-if="derivationUpdateType === 'custom'">Press Enter after typing a custom path to apply and reload.</p>
-            <p class="hint" v-if="isUpdatingDerivation">Updating derivation and reloading wallet...</p>
+          <div class="row active-derivation-custom-row" v-if="derivationUpdateType === 'custom'">
+            <label for="active-custom-derivation-input">Custom Path</label>
+            <input
+              id="active-custom-derivation-input"
+              v-model="customDerivationPathUpdate"
+              placeholder="m/44'/145'/0' or m/44'/145'/0'/0/0"
+              @change="applyCustomDerivationIfValid"
+              @keydown.enter.prevent="applyCustomDerivationIfValid"
+            />
           </div>
+          <p class="hint" v-if="derivationUpdateType === 'custom'">Press Enter after typing a custom path to apply and reload.</p>
         </div>
         <div v-else class="hint">Create or import a wallet to get started.</div>
       </section>
@@ -2170,6 +2375,111 @@ onBeforeUnmount(() => {
       </section>
     </div>
 
+    <footer class="status-menu" aria-label="Purze status menu">
+      <div class="brand-chip status-brand-chip">
+        <a
+          class="brand-icon-wrap status-brand-link"
+          href="https://github.com/invalidcastvibe/purze"
+          target="_blank"
+          rel="noopener noreferrer"
+          title="Open Purze GitHub repository"
+          aria-label="Open Purze GitHub repository"
+        >
+          <FontAwesomeIcon :icon="['fas', 'wallet']" class="brand-icon" />
+        </a>
+        <div class="brand-copy status-brand-copy" aria-hidden="true">
+          <strong class="brand-name status-brand-name">Purze</strong>
+          <span class="brand-tagline status-brand-tagline">Pocket BCH purse</span>
+        </div>
+      </div>
+      <div class="status-pills" role="list" aria-label="Wallet status indicators">
+        <button
+          class="status-pill"
+          role="listitem"
+          type="button"
+          @click="openWalletListModal"
+          :title="activeWalletName ? `Wallet: ${activeWalletName}` : 'No active wallet selected'"
+          :aria-label="activeWalletName ? `Wallet: ${activeWalletName}` : 'No active wallet selected'"
+        >
+          <FontAwesomeIcon :icon="['fas', 'user']" class="status-pill-icon" />
+        </button>
+        <button
+          class="status-pill"
+          role="listitem"
+          type="button"
+          :class="{ 'status-pill-live': hasActiveWcSessions }"
+          @click="openWalletConnectModal"
+          :title="hasActiveWcSessions ? `WalletConnect live with ${wcSessionCount} sessions` : 'WalletConnect offline'"
+          :aria-label="hasActiveWcSessions ? `WalletConnect live with ${wcSessionCount} sessions` : 'WalletConnect offline'"
+        >
+          <FontAwesomeIcon :icon="['fas', 'link']" class="status-pill-icon" />
+          <span v-if="hasActiveWcSessions" class="status-pill-dot" aria-hidden="true"></span>
+        </button>
+        <div class="notification-wrap" ref="notificationMenuEl" role="listitem">
+          <button
+            class="status-pill"
+            type="button"
+            :class="{ 'status-pill-alert': notificationCount > 0 || pendingWcRequests.length > 0 }"
+            @click="toggleNotificationMenu"
+            :title="notificationCount > 0 ? `${notificationCount} unread notifications` : 'No unread notifications'"
+            :aria-label="notificationCount > 0 ? `${notificationCount} unread notifications` : 'No unread notifications'"
+            :aria-expanded="notificationMenuOpen"
+            aria-haspopup="menu"
+          >
+            <FontAwesomeIcon :icon="['fas', 'bell']" class="status-pill-icon" />
+            <span v-if="notificationCount > 0" class="status-pill-badge" aria-hidden="true">{{ notificationCount }}</span>
+          </button>
+          <div v-if="notificationMenuOpen" class="notification-menu" role="menu" aria-label="Notifications list">
+            <div class="notification-menu-head">
+              <strong>Notifications</strong>
+              <button
+                v-if="notificationCount > 0"
+                class="notification-mark-read-btn"
+                @click="markAllNotificationsRead"
+                type="button"
+              >
+                Mark all as read
+              </button>
+            </div>
+            <div v-if="notificationItems.length === 0" class="notification-empty">
+              {{ hasEnabledNotificationTypes ? 'No new notifications.' : 'All notification types are turned off.' }}
+            </div>
+            <button
+              v-for="item in notificationItems"
+              :key="item.id"
+              class="notification-item"
+              :class="{ 'is-unread': !item.read }"
+              role="menuitem"
+              @click="handleNotificationClick(item)"
+            >
+              <span class="notification-item-avatar" aria-hidden="true">
+                <FontAwesomeIcon :icon="['fas', item.icon]" class="notification-item-icon" />
+              </span>
+              <span class="notification-item-content">
+                <span class="notification-item-message">{{ item.message }}</span>
+                <span class="notification-item-meta">
+                  <span class="notification-item-label">{{ item.label }}</span>
+                  <span class="notification-item-time">{{ formatNotificationTime(item.createdAt) }}</span>
+                </span>
+              </span>
+              <span class="notification-unread-dot" aria-hidden="true"></span>
+            </button>
+          </div>
+        </div>
+        <button
+          class="status-pill"
+          role="listitem"
+          type="button"
+          :class="{ 'status-pill-live': mobileCompactMode }"
+          @click="toggleMobileCompactMode"
+          :title="mobileCompactMode ? 'Turn compact mode off' : 'Turn compact mode on'"
+          :aria-label="mobileCompactMode ? 'Turn compact mode off' : 'Turn compact mode on'"
+        >
+          <FontAwesomeIcon :icon="['fas', 'sliders']" class="status-pill-icon" />
+        </button>
+      </div>
+    </footer>
+
     <div v-if="activeOverlayScreen === 'wallet-list'" class="action-sheet-overlay" @click.self="closeWalletListModal">
       <dialog class="action-sheet wallet-list-modal" open aria-label="Wallet list">
         <div class="action-sheet-header">
@@ -2182,9 +2492,30 @@ onBeforeUnmount(() => {
           </button>
         </div>
 
+        <div class="wallet-modal-tabs" role="tablist" aria-label="Wallet modal sections">
+          <button
+            class="wallet-modal-tab"
+            :class="{ active: walletModalView === 'wallets' }"
+            role="tab"
+            :aria-selected="walletModalView === 'wallets'"
+            @click="setWalletModalView('wallets')"
+          >
+            Wallets
+          </button>
+          <button
+            class="wallet-modal-tab"
+            :class="{ active: walletModalView === 'notifications' }"
+            role="tab"
+            :aria-selected="walletModalView === 'notifications'"
+            @click="setWalletModalView('notifications')"
+          >
+            Notification settings
+          </button>
+        </div>
+
         <div class="manage-wallet-info wallet-list-panel">
-          <div v-if="wallets.length === 0" class="hint">No wallets yet.</div>
-          <ul v-else class="wallet-list">
+          <div v-if="walletModalView === 'wallets' && wallets.length === 0" class="hint">No wallets yet.</div>
+          <ul v-if="walletModalView === 'wallets' && wallets.length > 0" class="wallet-list">
             <li
               v-for="wallet in wallets"
               :key="`modal-${wallet.name}`"
@@ -2204,9 +2535,36 @@ onBeforeUnmount(() => {
               </div>
             </li>
           </ul>
+
+          <section
+            v-if="walletModalView === 'notifications'"
+            class="wallet-notification-settings wallet-notification-settings-panel"
+            aria-label="Notification settings"
+          >
+            <div class="wallet-notification-settings-head">
+              <strong>Notification Settings</strong>
+              <span class="hint">Control what appears in the bell list</span>
+            </div>
+            <div class="wallet-notification-setting" v-for="item in allNotificationItems" :key="`notif-setting-${item.id}`">
+              <span class="wallet-notification-setting-label">
+                <FontAwesomeIcon :icon="['fas', item.icon]" class="notification-item-icon" />
+                {{ item.label }}
+              </span>
+              <label class="toggle-switch" :for="`notif-toggle-${item.id}`">
+                <input
+                  class="toggle-switch-input"
+                  type="checkbox"
+                  :id="`notif-toggle-${item.id}`"
+                  :checked="notificationSettings[item.settingKey]"
+                  @change="onNotificationSettingToggle(item.settingKey, $event)"
+                />
+                <span class="toggle-switch-slider" aria-hidden="true"></span>
+              </label>
+            </div>
+          </section>
         </div>
 
-        <button class="action-sheet-btn" @click="closeWalletListModal(); openCreateImportModal()">
+        <button v-if="walletModalView === 'wallets'" class="action-sheet-btn" @click="closeWalletListModal(); openCreateImportModal()">
           <FontAwesomeIcon :icon="['fas', 'plus']" class="icon-btn" />Add / Import Wallet
         </button>
       </dialog>
@@ -2768,7 +3126,6 @@ onBeforeUnmount(() => {
               />
             </div>
             <p class="hint" v-if="derivationUpdateType === 'custom'">Press Enter after typing a custom path to apply and reload.</p>
-            <p class="hint" v-if="isUpdatingDerivation">Updating derivation and reloading wallet...</p>
           </div>
         </template>
 
@@ -2937,1616 +3294,4 @@ onBeforeUnmount(() => {
   </main>
 </template>
 
-<style scoped>
-@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@500;600;700&family=JetBrains+Mono:wght@500;700&display=swap');
-
-.app-shell {
-  max-width: 1120px;
-  margin: 0 auto;
-  padding: 14px 14px calc(18px + env(safe-area-inset-bottom));
-  font-family: 'Manrope', 'Source Sans 3', 'Noto Sans', ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-  font-size: 14px;
-  color: #e6eefc;
-  -webkit-text-size-adjust: 100%;
-  overflow-x: clip;
-}
-.app-shell,
-.app-shell * {
-  box-sizing: border-box;
-  min-width: 0;
-}
-.app-shell::before {
-  content: '';
-  position: fixed;
-  inset: 0;
-  background:
-    linear-gradient(155deg, #0b1020, #111827 46%, #090f1d);
-  z-index: -3;
-  pointer-events: none;
-}
-
-.app-shell::after {
-  content: '';
-  position: fixed;
-  inset: -28vmax;
-  background:
-    radial-gradient(circle at 12% 20%, rgba(255, 77, 109, 0.33), transparent 36%),
-    radial-gradient(circle at 24% 78%, rgba(255, 159, 28, 0.28), transparent 34%),
-    radial-gradient(circle at 52% 24%, rgba(255, 230, 109, 0.23), transparent 32%),
-    radial-gradient(circle at 72% 76%, rgba(46, 196, 182, 0.27), transparent 35%),
-    radial-gradient(circle at 90% 40%, rgba(58, 134, 255, 0.32), transparent 36%),
-    radial-gradient(circle at 58% 54%, rgba(131, 56, 236, 0.24), transparent 34%);
-  filter: blur(52px) saturate(120%);
-  transform: translateZ(0);
-  z-index: -2;
-  pointer-events: none;
-}
-
-.topbar-simple {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 8px;
-  margin-bottom: 12px;
-  align-items: center;
-}
-
-.top-wallet-group {
-  display: inline-flex;
-  align-items: stretch;
-  min-width: 0;
-}
-
-.top-quick-actions {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.top-wallet-btn,
-.top-connect-btn {
-  min-height: 42px;
-  border-radius: 12px;
-}
-
-.top-wallet-btn {
-  text-align: left;
-  display: inline-flex;
-  align-items: center;
-  justify-content: flex-start;
-  gap: 8px;
-  flex: 1 1 auto;
-  border-radius: 0 12px 12px 0;
-  border-left: 0;
-}
-
-.top-receive-btn {
-  width: 42px;
-  min-width: 42px;
-  min-height: 42px;
-  padding: 0;
-  display: inline-grid;
-  place-items: center;
-  border-radius: 12px 0 0 12px;
-}
-
-.top-wallet-text {
-  display: grid;
-  gap: 1px;
-}
-
-.top-wallet-caption {
-  font-size: 0.68rem;
-  opacity: 0.78;
-  letter-spacing: 0.02em;
-}
-
-.top-wallet-current {
-  font-size: 0.88rem;
-  line-height: 1.1;
-}
-
-.top-connect-btn {
-  width: 42px;
-  min-width: 42px;
-  padding: 0;
-  display: inline-grid;
-  place-items: center;
-  position: relative;
-}
-
-.top-refresh-btn {
-  border-color: rgba(147, 197, 253, 0.5);
-}
-
-.top-connect-icon {
-  font-size: 0.95rem;
-  margin-right: 0;
-}
-
-.top-connect-btn.wc-connected {
-  border-color: rgba(110, 231, 183, 0.9);
-  background:
-    radial-gradient(circle at 20% 20%, rgba(110, 231, 183, 0.36), transparent 65%),
-    linear-gradient(155deg, rgba(6, 78, 59, 0.52), rgba(4, 47, 46, 0.5));
-  box-shadow: 0 0 0 1px rgba(110, 231, 183, 0.28), 0 0 18px rgba(52, 211, 153, 0.34);
-}
-
-.top-connect-btn.wc-connected .top-connect-icon {
-  color: #d1fae5;
-}
-
-.wc-connected-dot {
-  position: absolute;
-  top: 7px;
-  right: 7px;
-  width: 8px;
-  height: 8px;
-  border-radius: 999px;
-  background: #34d399;
-  box-shadow: 0 0 0 2px rgba(15, 23, 42, 0.95), 0 0 8px rgba(52, 211, 153, 0.85);
-  animation: wcConnectedPulse 1.8s ease-out infinite;
-}
-
-@keyframes wcConnectedPulse {
-  0% {
-    transform: scale(1);
-    opacity: 1;
-  }
-  70% {
-    transform: scale(1.22);
-    opacity: 0.55;
-  }
-  100% {
-    transform: scale(1);
-    opacity: 1;
-  }
-}
-
-.wc-pending-badge {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 20px;
-  height: 20px;
-  margin-left: 8px;
-  padding: 0 6px;
-  border-radius: 999px;
-  border: 1px solid rgba(134, 239, 172, 0.5);
-  background: rgba(20, 83, 45, 0.65);
-  color: #dcfce7;
-  font-size: 0.7rem;
-}
-
-.home-stack {
-  display: grid;
-  gap: 12px;
-}
-
-.glass-card {
-  width: 100%;
-  padding: 14px;
-  border: 1px solid rgba(148, 163, 184, 0.26);
-  border-radius: 14px;
-  background: rgba(15, 23, 42, 0.28);
-  backdrop-filter: blur(6px);
-  -webkit-backdrop-filter: blur(6px);
-  box-shadow: 0 10px 28px rgba(2, 6, 23, 0.22);
-}
-
-.active-wallet-card {
-  position: relative;
-  z-index: 2;
-  overflow: visible;
-}
-
-.active-wallet-card.dropdown-open {
-  z-index: 12;
-}
-
-.tokens-preview-card {
-  position: relative;
-  z-index: 1;
-}
-
-.tokens-preview-head {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
-  align-items: center;
-  gap: 10px;
-  margin-bottom: 8px;
-}
-
-.tokens-preview-head h3 {
-  margin: 0;
-}
-.tokens-preview-usd {
-  font-size: 0.78rem;
-  color: #cbd5e1;
-  white-space: nowrap;
-}
-.status-toast {
-  position: fixed;
-  right: 12px;
-  top: calc(10px + env(safe-area-inset-top));
-  z-index: 70;
-  max-width: min(84vw, 420px);
-  padding: 8px 10px;
-  align-items: center;
-  border-radius: 10px;
-  background: rgba(15, 23, 42, 0.92);
-  color: #e2e8f0;
-  width: min(700px, 100%);
-  max-height: min(88dvh, 760px);
-  height: auto;
-  backdrop-filter: blur(8px);
-  border-radius: 16px;
-  overflow-wrap: anywhere;
-}
-.panel-grid {
-  display: grid;
-  gap: 14px;
-}
-.panel {
-  width: 100%;
-  padding: 15px;
-  border: 1px solid rgba(148, 163, 184, 0.26);
-  border-radius: 14px;
-  background: rgba(15, 23, 42, 0.28);
-  backdrop-filter: blur(6px);
-  -webkit-backdrop-filter: blur(6px);
-  box-shadow: 0 10px 28px rgba(2, 6, 23, 0.22);
-  overflow: visible;
-}
-.panel h2,
-.panel h3 {
-  margin: 0 0 10px;
-}
-.section-body {
-  margin-top: 10px;
-  padding: 10px 12px;
-  border: 1px solid rgba(191, 219, 254, 0.14);
-  border-radius: 12px;
-  background: rgba(15, 23, 42, 0.2);
-  backdrop-filter: blur(7px);
-  -webkit-backdrop-filter: blur(7px);
-}
-.collapse-toggle {
-  display: flex;
-  width: 100%;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 8px;
-  border: 1px solid rgba(191, 219, 254, 0.32);
-  border-radius: 12px;
-  background: linear-gradient(145deg, rgba(125, 211, 252, 0.18), rgba(59, 130, 246, 0.16));
-  backdrop-filter: blur(10px) saturate(125%);
-  -webkit-backdrop-filter: blur(10px) saturate(125%);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.22), 0 10px 24px rgba(2, 6, 23, 0.24);
-}
-.manager-body {
-  display: grid;
-  gap: 2px;
-  margin-top: 8px;
-  padding: 8px 10px;
-  border: 1px solid rgba(191, 219, 254, 0.14);
-  border-radius: 12px;
-  background: rgba(15, 23, 42, 0.2);
-  backdrop-filter: blur(7px);
-  -webkit-backdrop-filter: blur(7px);
-}
-.manager-subpanel {
-  margin-top: 12px;
-  padding-top: 10px;
-  border-top: 1px solid rgba(148, 163, 184, 0.22);
-}
-.manager-create-import {
-  margin-top: 14px;
-  padding-top: 12px;
-  padding-bottom: 8px;
-  border-top: 1px solid rgba(191, 219, 254, 0.35);
-  background: rgba(15, 23, 42, 0.14);
-  border-radius: 10px;
-  padding-left: 8px;
-  padding-right: 8px;
-}
-.wallet-list {
-  list-style: none;
-  padding-left: 0;
-  margin: 0;
-  display: grid;
-  gap: 0;
-}
-.wallet-list-panel {
-  min-height: 0;
-  overflow-y: auto;
-  overscroll-behavior: contain;
-  padding-bottom: 6px;
-  max-height: min(56dvh, 460px);
-}
-.wallet-item {
-  margin: 0;
-  padding: 2px 4px;
-  min-height: 34px;
-  border: 0;
-  border-bottom: 1px solid rgba(148, 163, 184, 0.22);
-  border-radius: 0;
-  background: transparent;
-  cursor: pointer;
-}
-.wallet-item:hover {
-  background: rgba(30, 41, 59, 0.28);
-}
-.wallet-item-main {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  min-height: 30px;
-}
-.wallet-item-actions {
-  display: flex;
-  gap: 4px;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-}
-.wallet-tag {
-  display: inline-block;
-  margin-left: 6px;
-  font-size: 11px;
-  padding: 2px 6px;
-  border-radius: 999px;
-  border: 1px solid rgba(148, 163, 184, 0.35);
-  color: #dbeafe;
-}
-.wallet-tag.source {
-  border-color: rgba(46, 196, 182, 0.5);
-}
-.wallet-tag.active {
-  border-color: rgba(59, 130, 246, 0.7);
-}
-.tiny-btn {
-  width: auto;
-  min-width: 0;
-  min-height: 30px;
-  padding: 5px 9px;
-  font-size: 12px;
-}
-.wallet-row-btn {
-  min-height: 24px;
-  padding: 2px 6px;
-  font-size: 11px;
-}
-.wallet-list-modal {
-  display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto;
-  min-height: 0;
-  overflow: auto;
-}
-.wallet-list-modal > .action-sheet-btn {
-  margin-top: 6px;
-}
-.active-derivation-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-}
-.active-derivation-btn {
-  width: auto;
-  min-height: 28px;
-  padding: 4px 8px;
-  white-space: nowrap;
-}
-.active-derivation-editor {
-  margin-top: 8px;
-  padding: 8px;
-  border: 1px solid rgba(148, 163, 184, 0.25);
-  border-radius: 10px;
-  background: rgba(15, 23, 42, 0.28);
-}
-.action-sheet-overlay {
-  position: fixed;
-  inset: 0;
-  background: rgba(2, 6, 23, 0.72);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 30;
-  padding: 12px;
-}
-.action-sheet {
-  width: min(700px, 100%);
-  max-height: min(88dvh, 760px);
-  height: auto;
-  margin: 0;
-  border-radius: 16px;
-  border: 1px solid rgba(191, 219, 254, 0.4);
-  background: linear-gradient(160deg, rgba(30, 41, 59, 0.95), rgba(15, 23, 42, 0.92));
-  backdrop-filter: blur(10px) saturate(125%);
-  -webkit-backdrop-filter: blur(10px) saturate(125%);
-  padding: 12px;
-  display: grid;
-  gap: 10px;
-  box-shadow: 0 18px 40px rgba(2, 6, 23, 0.52), inset 0 1px 0 rgba(255, 255, 255, 0.16);
-  color: #fff;
-  animation: modal-pop 180ms ease-out;
-  overflow-y: auto;
-}
-.action-sheet-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 2px 2px 8px;
-  border-bottom: 1px solid rgba(191, 219, 254, 0.2);
-}
-.action-sheet-title-wrap {
-  display: grid;
-  gap: 2px;
-}
-.action-sheet-title {
-  font-size: 1rem;
-}
-.action-sheet-subtitle {
-  font-size: 0.78rem;
-  opacity: 0.86;
-}
-.manage-view-tabs {
-  display: flex;
-  gap: 6px;
-}
-.tab-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 0;
-  width: auto;
-  min-height: 30px;
-  padding: 4px 9px;
-  font-size: 0.78rem;
-  border: 1px solid rgba(191, 219, 254, 0.3);
-  border-radius: 999px;
-  background: rgba(15, 23, 42, 0.38);
-}
-.tab-btn.active {
-  border-color: rgba(125, 211, 252, 0.65);
-  background: linear-gradient(180deg, rgba(59, 130, 246, 0.62), rgba(37, 99, 235, 0.56));
-}
-.action-sheet-btn {
-  width: 100%;
-  text-align: left;
-  min-height: 42px;
-  font-size: 0.95rem;
-  color: #fff;
-}
-.manage-wallet-info {
-  padding: 10px;
-  border: 1px solid rgba(191, 219, 254, 0.28);
-  border-radius: 10px;
-  background: rgba(15, 23, 42, 0.42);
-  display: grid;
-  gap: 7px;
-  font-size: 0.86rem;
-}
-.action-sheet .manage-wallet-info {
-  padding: 8px;
-  gap: 6px;
-  font-size: 0.82rem;
-}
-.action-sheet .row {
-  gap: 4px;
-  margin-bottom: 8px;
-}
-.action-sheet label {
-  font-size: 0.76rem;
-}
-.action-sheet input,
-.action-sheet textarea,
-.action-sheet select {
-  min-height: 32px;
-  padding: 5px 7px;
-  font-size: 13px;
-}
-.action-sheet select {
-  min-height: 32px;
-  font-size: 13px;
-  padding-right: 24px;
-}
-.action-sheet button {
-  min-height: 32px;
-  padding: 5px 9px;
-  font-size: 0.8rem;
-}
-.action-sheet .tiny-btn,
-.action-sheet .wallet-row-btn,
-.action-sheet .token-send-btn,
-.action-sheet .token-copy-btn,
-.action-sheet .inline-copy-btn {
-  min-height: 22px;
-  min-width: 22px;
-  padding: 1px 5px;
-}
-.action-sheet .action-sheet-btn {
-  min-height: 32px;
-  font-size: 0.8rem;
-}
-.action-sheet .tab-btn {
-  min-height: 26px;
-  padding: 3px 8px;
-  font-size: 0.74rem;
-}
-.create-import-modal {
-  gap: 8px;
-  grid-template-rows: auto minmax(0, 1fr) auto;
-}
-.create-import-modal .manage-wallet-info {
-  padding: 6px 8px;
-  gap: 4px;
-}
-.create-import-modal .row {
-  gap: 3px;
-  margin: 0 0 6px;
-}
-.create-import-modal .row:last-child {
-  margin-bottom: 0;
-}
-.create-import-modal label {
-  font-size: 0.72rem;
-  line-height: 1.15;
-}
-.create-import-modal input,
-.create-import-modal textarea,
-.create-import-modal select {
-  min-height: 30px;
-  padding: 4px 6px;
-  font-size: 12px;
-}
-.create-import-modal textarea {
-  min-height: 64px;
-}
-.create-import-modal .action-sheet-btn {
-  min-height: 30px;
-  font-size: 0.78rem;
-  padding: 5px 8px;
-}
-.manage-wallet-badges {
-  display: flex;
-  gap: 6px;
-  flex-wrap: wrap;
-}
-.manage-field {
-  display: grid;
-  gap: 2px;
-}
-.manage-label {
-  font-size: 0.72rem;
-  opacity: 0.7;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-.manage-quick-hint {
-  display: grid;
-  gap: 2px;
-  padding: 8px;
-  border: 1px solid rgba(125, 211, 252, 0.28);
-  border-radius: 8px;
-  background: rgba(30, 64, 175, 0.14);
-}
-.manage-danger-zone {
-  border: 1px solid rgba(248, 113, 113, 0.35);
-  border-radius: 10px;
-  padding: 9px;
-  background: rgba(127, 29, 29, 0.16);
-  display: grid;
-  gap: 7px;
-}
-.manage-danger-title {
-  font-weight: 700;
-  color: #fecaca;
-}
-.delete-wallet-btn {
-  border-color: rgba(248, 113, 113, 0.65);
-  background: linear-gradient(180deg, rgba(220, 38, 38, 0.74), rgba(185, 28, 28, 0.7));
-}
-@keyframes modal-pop {
-  0% {
-    opacity: 0;
-    transform: translateY(8px) scale(0.985);
-  }
-  100% {
-    opacity: 1;
-    transform: translateY(0) scale(1);
-  }
-}
-.icon-close {
-  min-width: 38px;
-  width: 38px;
-  min-height: 38px;
-  padding: 0;
-}
-.action-sheet .icon-close {
-  min-width: 32px;
-  width: 32px;
-  min-height: 32px;
-}
-.seed-phrase {
-  margin-top: 8px;
-  padding: 8px;
-  border-radius: 8px;
-  border: 1px dashed rgba(147, 197, 253, 0.55);
-  background: rgba(15, 23, 42, 0.35);
-}
-.row {
-  display: grid;
-  gap: 7px;
-  margin-bottom: 12px;
-}
-label {
-  font-weight: 600;
-  font-size: 0.9rem;
-}
-input,
-textarea,
-select,
-button {
-  font: inherit;
-}
-input,
-textarea,
-select {
-  width: 100%;
-  max-width: 100%;
-  box-sizing: border-box;
-  padding: 8px 10px;
-  border: 1px solid rgba(148, 163, 184, 0.4);
-  border-radius: 8px;
-  font-size: 15px;
-  min-height: 40px;
-  background: rgba(15, 23, 42, 0.45);
-  color: #e2e8f0;
-}
-select {
-  min-height: 42px;
-  font-size: 16px;
-  line-height: 1.2;
-  padding-right: 30px;
-}
-button {
-  width: 100%;
-  max-width: 100%;
-  box-sizing: border-box;
-  padding: 8px 12px;
-  border: 1px solid rgba(125, 211, 252, 0.42);
-  border-radius: 8px;
-  background: linear-gradient(155deg, rgba(20, 83, 45, 0.36), rgba(6, 78, 59, 0.38));
-  backdrop-filter: blur(6px) saturate(120%);
-  -webkit-backdrop-filter: blur(6px) saturate(120%);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.14), 0 4px 14px rgba(2, 6, 23, 0.2);
-  color: #fff;
-  cursor: pointer;
-  min-height: 36px;
-  font-weight: 600;
-  font-size: 0.92rem;
-}
-button:disabled {
-  background: rgba(51, 65, 85, 0.45);
-  border-color: rgba(148, 163, 184, 0.35);
-  box-shadow: none;
-  cursor: not-allowed;
-}
-.meta {
-  margin-top: 12px;
-  display: grid;
-  gap: 10px;
-}
-.address-grid {
-  display: grid;
-  gap: 10px;
-}
-.address-card {
-  border: 1px solid rgba(125, 211, 252, 0.26);
-  border-radius: 12px;
-  background: linear-gradient(155deg, rgba(14, 26, 48, 0.72), rgba(15, 23, 42, 0.42));
-  padding: 10px;
-}
-.address-card-bch {
-  border-color: rgba(56, 189, 248, 0.45);
-  box-shadow: inset 0 0 0 1px rgba(125, 211, 252, 0.2);
-}
-.address-card-token {
-  border-color: rgba(45, 212, 191, 0.45);
-  box-shadow: inset 0 0 0 1px rgba(94, 234, 212, 0.2);
-}
-.address-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-}
-.address-title-wrap {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-}
-.address-head-actions {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-.address-icon-wrap {
-  width: 28px;
-  height: 28px;
-  border-radius: 999px;
-  border: 1px solid rgba(125, 211, 252, 0.35);
-  display: inline-grid;
-  place-items: center;
-  color: #67e8f9;
-  background: rgba(2, 6, 23, 0.48);
-}
-.address-title-stack {
-  display: grid;
-  gap: 1px;
-}
-.address-title {
-  font-family: inherit;
-  font-weight: 700;
-  font-size: 0.76rem;
-  letter-spacing: 0.03em;
-  color: #e0f2fe;
-}
-.address-subtitle {
-  font-size: 0.66rem;
-  color: #93c5fd;
-}
-.address-copy-btn {
-  border-color: rgba(147, 197, 253, 0.38);
-  background: linear-gradient(180deg, rgba(30, 64, 175, 0.48), rgba(30, 58, 138, 0.42));
-}
-.address-value {
-  margin-top: 8px;
-  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 0.76rem;
-  line-height: 1.35;
-  color: #ccfbf1;
-  text-shadow: 0 0 10px rgba(45, 212, 191, 0.16);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.meta-head-inline {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-}
-.inline-copy-btn {
-  min-height: 22px;
-  width: 22px;
-  min-width: 22px;
-  padding: 0;
-  display: inline-grid;
-  place-items: center;
-}
-.inline-copy-icon {
-  font-size: 0.75rem;
-  margin-right: 0;
-}
-.active-wallet-actions {
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-.send-asset-modal.send-asset-modal-token {
-  overflow: hidden;
-  grid-template-rows: auto auto minmax(0, 1fr);
-}
-.send-history-card {
-  margin-top: 0;
-  display: grid;
-  gap: 7px;
-}
-.send-asset-modal-token .send-history-card {
-  min-height: 0;
-  overflow: hidden;
-  grid-template-rows: auto minmax(0, 1fr);
-}
-.send-history-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-}
-.send-history-head strong {
-  display: inline-flex;
-  align-items: center;
-  font-size: 0.8rem;
-}
-.send-history-body {
-  min-height: 0;
-  overflow-y: auto;
-  padding-right: 2px;
-}
-.send-history-list {
-  display: grid;
-  gap: 6px;
-}
-.send-history-item {
-  padding: 7px 8px;
-  border: 1px solid rgba(148, 163, 184, 0.2);
-  border-radius: 8px;
-  background: rgba(15, 23, 42, 0.32);
-  display: grid;
-  gap: 3px;
-}
-.send-history-item-top {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  font-size: 0.78rem;
-}
-.send-history-top-right {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-.send-history-open-btn {
-  width: 22px;
-  min-width: 22px;
-  min-height: 22px;
-  padding: 0;
-  display: inline-grid;
-  place-items: center;
-}
-.send-history-direction {
-  font-size: 0.68rem;
-  text-transform: uppercase;
-  letter-spacing: 0.03em;
-  opacity: 0.88;
-}
-.send-history-direction.sent {
-  color: #fca5a5;
-}
-.send-history-direction.received {
-  color: #86efac;
-}
-.send-history-item-meta {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  font-size: 0.66rem;
-  color: #bfdbfe;
-}
-.receive-qr-wrap {
-  margin-top: 6px;
-  border: 1px solid rgba(148, 163, 184, 0.3);
-  border-radius: 10px;
-  background: rgba(15, 23, 42, 0.48);
-  min-height: 170px;
-  display: grid;
-  place-items: center;
-  padding: 10px;
-}
-.receive-qr {
-  width: min(250px, 72vw);
-  height: auto;
-  border-radius: 8px;
-}
-table {
-  width: 100%;
-  border-collapse: collapse;
-  min-width: 540px;
-}
-th,
-td {
-  border-bottom: 1px solid rgba(148, 163, 184, 0.2);
-  text-align: left;
-  padding: 5px 6px;
-  font-size: 0.82rem;
-  line-height: 1.2;
-}
-.desktop-table table {
-  min-width: 500px;
-}
-.desktop-table thead th {
-  font-size: 0.76rem;
-  opacity: 0.85;
-  letter-spacing: 0.01em;
-}
-.table-wrap {
-  overflow-x: auto;
-  -webkit-overflow-scrolling: touch;
-}
-.desktop-table {
-  display: none;
-}
-.token-cards {
-  display: grid;
-  gap: 0;
-}
-.token-card {
-  display: grid;
-  grid-template-columns: 26px minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 6px;
-  border: 0;
-  border-bottom: 1px solid rgba(148, 163, 184, 0.22);
-  background: transparent;
-  border-radius: 0;
-  height: 42px;
-  padding: 3px 0;
-  overflow: hidden;
-}
-.token-icon-slot {
-  width: 24px;
-  height: 24px;
-  min-width: 24px;
-  min-height: 24px;
-  max-width: 24px;
-  max-height: 24px;
-  flex: 0 0 24px;
-  border-radius: 8px;
-  display: inline-grid;
-  place-items: center;
-  border: 1px solid rgba(191, 219, 254, 0.24);
-  background: rgba(30, 41, 59, 0.38);
-  color: #bae6fd;
-  font-size: 0.78rem;
-}
-.token-icon-btn {
-  padding: 0;
-  cursor: pointer;
-  width: 24px;
-  height: 24px;
-  min-width: 24px;
-  min-height: 24px;
-  max-width: 24px;
-  max-height: 24px;
-}
-.token-icon-btn.copied {
-  border-color: rgba(125, 211, 252, 0.7);
-  box-shadow: 0 0 0 1px rgba(125, 211, 252, 0.4);
-}
-.token-icon-image {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  border-radius: 7px;
-}
-.token-info-grid {
-  min-width: 0;
-  display: grid;
-  gap: 1px;
-}
-.token-main-line {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  min-width: 0;
-  white-space: nowrap;
-}
-.token-card-title {
-  font-size: 0.8rem;
-  font-weight: 600;
-  margin-bottom: 0;
-  min-width: 0;
-  flex: 1 1 auto;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.token-favorite-badge {
-  display: inline-flex;
-  align-items: center;
-  margin-right: 5px;
-  color: #facc15;
-  font-size: 0.65rem;
-  vertical-align: middle;
-}
-.token-quick-stats {
-  display: none;
-}
-.token-usd-value {
-  flex: 0 0 auto;
-  font-size: 0.78rem;
-  white-space: nowrap;
-}
-.token-sub-line {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  min-width: 0;
-}
-.token-price-source {
-  min-width: 0;
-  font-size: 0.54rem;
-  opacity: 0.72;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.token-amount-main {
-  flex: 0 0 auto;
-  font-size: 0.58rem;
-  opacity: 0.86;
-  white-space: nowrap;
-}
-.token-nft-mini {
-  opacity: 0.72;
-  font-size: 0.68rem;
-}
-.token-id {
-  font-size: 0.64rem;
-  opacity: 0.7;
-  margin-top: 0;
-  margin-bottom: 0;
-  display: inline-block;
-  max-width: 66px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.token-id-btn {
-  width: auto;
-  min-height: 0;
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  padding: 0;
-  border: 0;
-  background: transparent;
-  margin-bottom: 0;
-  min-width: 0;
-  max-width: 92px;
-  overflow: hidden;
-  color: #dbeafe;
-}
-.token-id-copy {
-  font-size: 0.62rem;
-  opacity: 0.62;
-  display: none;
-}
-.copy-check {
-  width: 8px;
-  height: 4px;
-  border-left: 2px solid #7dd3fc;
-  border-bottom: 2px solid #7dd3fc;
-  transform: rotate(-45deg) scale(0.6);
-  transform-origin: center;
-  opacity: 0;
-}
-.copy-check.show {
-  animation: copy-check-pop 420ms ease-out;
-  opacity: 1;
-}
-.token-id-btn.copied .token-id-copy {
-  color: #7dd3fc;
-  opacity: 0.95;
-}
-.token-actions-line {
-  display: inline-flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 4px;
-  flex: 0 0 auto;
-}
-.token-send-btn {
-  min-height: 20px;
-  min-width: 20px;
-  padding: 1px 4px;
-}
-.token-favorite-btn,
-.token-hide-btn,
-.token-unhide-btn {
-  min-height: 20px;
-  min-width: 20px;
-  padding: 1px 4px;
-}
-.token-favorite-btn.active {
-  border-color: rgba(250, 204, 21, 0.6);
-  color: #facc15;
-  background: linear-gradient(180deg, rgba(120, 53, 15, 0.5), rgba(92, 40, 11, 0.42));
-}
-.token-hide-btn {
-  border-color: rgba(248, 113, 113, 0.5);
-  color: #fecaca;
-  background: linear-gradient(180deg, rgba(153, 27, 27, 0.44), rgba(127, 29, 29, 0.36));
-}
-.token-unhide-btn {
-  border-color: rgba(110, 231, 183, 0.5);
-  color: #a7f3d0;
-  background: linear-gradient(180deg, rgba(6, 95, 70, 0.48), rgba(4, 78, 58, 0.4));
-}
-.token-copy-btn {
-  min-height: 20px;
-  min-width: 20px;
-  padding: 1px 4px;
-}
-.token-copy-btn.copied {
-  color: #7dd3fc;
-  border-color: rgba(125, 211, 252, 0.5);
-}
-.token-card-row {
-  display: flex;
-  justify-content: space-between;
-  align-items: baseline;
-  gap: 8px;
-  font-size: 0.82rem;
-}
-.hidden-token-panel {
-  margin-top: 8px;
-  border-top: 1px dashed rgba(148, 163, 184, 0.36);
-  padding-top: 8px;
-  display: grid;
-  gap: 6px;
-}
-.hidden-token-panel-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-}
-.hidden-token-panel-head strong {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 0.78rem;
-}
-@keyframes copy-check-pop {
-  0% {
-    opacity: 0;
-    transform: rotate(-45deg) scale(0.4);
-  }
-  55% {
-    opacity: 1;
-    transform: rotate(-45deg) scale(1.15);
-  }
-  100% {
-    opacity: 1;
-    transform: rotate(-45deg) scale(1);
-  }
-}
-ul {
-  list-style: none;
-  padding-left: 0;
-}
-.wallet-connect-modal {
-  gap: 9px;
-  font-family: inherit;
-}
-.wallet-connect-modal .manage-wallet-info {
-  border: 1px solid rgba(148, 163, 184, 0.26);
-  border-radius: 14px;
-  background: rgba(15, 23, 42, 0.28);
-  backdrop-filter: blur(6px);
-  -webkit-backdrop-filter: blur(6px);
-  box-shadow: 0 10px 28px rgba(2, 6, 23, 0.22);
-}
-.wc-modal-title {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  letter-spacing: 0.03em;
-}
-.wc-title-icon {
-  color: #7dd3fc;
-  font-size: 1.02rem;
-}
-.wallet-connect-modal .manage-label {
-  color: #bae6fd;
-}
-.wallet-connect-modal .hint {
-  color: #dbeafe;
-}
-.wc-overview-card {
-  background: rgba(15, 23, 42, 0.24);
-}
-.wc-overview-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 8px;
-}
-.wc-overview-item {
-  border: 1px solid rgba(191, 219, 254, 0.14);
-  border-radius: 9px;
-  padding: 7px 8px;
-  background: rgba(15, 23, 42, 0.2);
-  display: grid;
-  gap: 2px;
-}
-.wc-overview-item.active {
-  border-color: rgba(110, 231, 183, 0.5);
-  box-shadow: inset 3px 0 0 rgba(110, 231, 183, 0.55);
-}
-.wc-overview-item.pending {
-  border-color: rgba(251, 191, 36, 0.5);
-  box-shadow: inset 3px 0 0 rgba(251, 191, 36, 0.65);
-}
-.wc-overview-item strong {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 0.82rem;
-  color: #f0f9ff;
-}
-.wc-overview-icon {
-  color: #7dd3fc;
-  font-size: 0.92rem;
-}
-.wc-overview-hint {
-  margin: 0;
-}
-.wc-pending-card {
-  background: rgba(15, 23, 42, 0.24);
-}
-.wc-connection-proposal-card {
-  background: rgba(15, 23, 42, 0.24);
-}
-.wc-proposal-dapp {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.wc-section-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-}
-.wc-section-title-wrap {
-  display: grid;
-  gap: 1px;
-  min-width: 0;
-}
-.wc-section-title {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  font-size: 0.85rem;
-  color: #f0f9ff;
-  letter-spacing: 0.02em;
-}
-.wc-section-icon {
-  color: #67e8f9;
-  font-size: 0.92rem;
-}
-.wc-method-pill {
-  display: inline-flex;
-  align-items: center;
-  width: fit-content;
-  border-radius: 999px;
-  padding: 2px 8px;
-  border: 0;
-  background: rgba(30, 64, 175, 0.28);
-  font-size: 0.74rem;
-}
-.wc-approval-actions button {
-  flex: 1 1 180px;
-}
-.wc-connect-card {
-  background: rgba(15, 23, 42, 0.24);
-}
-.wc-uri-row {
-  margin-bottom: 4px;
-  padding: 9px;
-  border: 1px solid rgba(125, 211, 252, 0.28);
-  border-radius: 10px;
-  background: rgba(30, 64, 175, 0.14);
-  box-shadow: inset 2px 0 0 rgba(125, 211, 252, 0.48);
-}
-.wc-uri-label {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 0.8rem;
-  font-weight: 700;
-  color: #e0f2fe;
-  letter-spacing: 0.02em;
-}
-.wc-uri-input {
-  background: rgba(2, 6, 23, 0.72);
-  border-color: rgba(125, 211, 252, 0.68);
-  color: #f8fafc;
-  min-height: 38px;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
-}
-.wc-uri-input::placeholder {
-  color: rgba(191, 219, 254, 0.86);
-}
-.wc-uri-input:focus {
-  outline: none;
-  border-color: rgba(103, 232, 249, 0.9);
-  box-shadow: 0 0 0 2px rgba(34, 211, 238, 0.25), inset 0 1px 0 rgba(255, 255, 255, 0.1);
-}
-.wc-uri-hint {
-  margin: -1px 0 0;
-  color: #bfdbfe;
-}
-.wc-connected-summary {
-  display: grid;
-  gap: 7px;
-  padding: 8px 9px;
-  border: 1px solid rgba(191, 219, 254, 0.14);
-  border-radius: 10px;
-  background: rgba(15, 23, 42, 0.2);
-}
-.wc-inline-icon {
-  color: #67e8f9;
-  font-size: 0.9rem;
-  margin-right: 5px;
-}
-.wc-sessions-card {
-  background: rgba(15, 23, 42, 0.24);
-}
-.wc-empty-state {
-  border: 1px solid rgba(191, 219, 254, 0.14);
-  border-radius: 9px;
-  padding: 10px;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  background: rgba(15, 23, 42, 0.2);
-}
-.wc-empty-icon {
-  color: #93c5fd;
-  font-size: 1rem;
-}
-.wc-empty-state strong {
-  display: block;
-  font-size: 0.8rem;
-}
-.wc-empty-state .hint {
-  margin: 2px 0 0;
-}
-.wc-session-list li {
-  margin-bottom: 12px;
-  padding: 10px;
-  border: 1px solid rgba(191, 219, 254, 0.14);
-  border-radius: 8px;
-  background: rgba(15, 23, 42, 0.2);
-}
-.wc-session-item {
-  margin-bottom: 10px;
-}
-.wc-session-item:last-child {
-  margin-bottom: 0;
-}
-.wc-session-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.wc-dapp-avatar {
-  width: 24px;
-  height: 24px;
-  min-width: 24px;
-  border-radius: 6px;
-  background: rgba(30, 41, 59, 0.55);
-  display: inline-grid;
-  place-items: center;
-  overflow: hidden;
-  font-size: 0.72rem;
-  font-weight: 700;
-  color: #cbd5e1;
-}
-.wc-dapp-avatar img {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-}
-.wc-dapp-meta {
-  min-width: 0;
-  display: grid;
-  gap: 1px;
-}
-.wc-dapp-meta strong {
-  font-size: 0.8rem;
-  line-height: 1.1;
-}
-.wc-dapp-meta .hint {
-  font-size: 0.68rem;
-}
-.wc-disconnect-btn {
-  margin-left: auto;
-  white-space: nowrap;
-}
-.wc-session-stats {
-  margin-top: 5px;
-  display: grid;
-  gap: 2px;
-  font-size: 0.7rem;
-  opacity: 0.86;
-}
-.wc-stat-icon {
-  color: #93c5fd;
-  margin-right: 5px;
-  font-size: 0.78rem;
-}
-.wc-account-line {
-  margin-top: 4px;
-  font-size: 0.68rem;
-}
-.mono {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  overflow-wrap: anywhere;
-  word-break: break-word;
-  display: block;
-  max-width: 100%;
-  color: #dbeafe;
-}
-.hint {
-  color: #cbd5e1;
-  font-size: 13px;
-}
-
-.icon-head {
-  margin-right: 8px;
-  color: #93c5fd;
-}
-
-.icon-title {
-  margin-right: 8px;
-  color: #7dd3fc;
-  font-size: 0.95em;
-}
-
-.icon-btn {
-  margin-right: 7px;
-  font-size: 0.92em;
-}
-
-hr {
-  border: 0;
-  border-top: 1px solid rgba(148, 163, 184, 0.25);
-  margin: 12px 0;
-}
-
-@media (max-width: 460px) {
-  .app-shell {
-    padding: 12px 10px calc(16px + env(safe-area-inset-bottom));
-    font-size: 13px;
-  }
-  .panel {
-    padding: 10px;
-  }
-  .topbar-simple {
-    grid-template-columns: minmax(0, 1fr) auto;
-    margin-bottom: 10px;
-  }
-  .status-toast {
-    right: 8px;
-    top: calc(8px + env(safe-area-inset-top));
-    max-width: min(92vw, 360px);
-    font-size: 0.68rem;
-    padding: 7px 8px;
-  }
-  .panel h2 {
-    font-size: 1rem;
-  }
-  .panel h3 {
-    font-size: 0.95rem;
-  }
-  button {
-    border-radius: 10px;
-  }
-  .compact-mobile .panel {
-    padding: 9px;
-  }
-  .compact-mobile .row {
-    margin-bottom: 7px;
-  }
-  .compact-mobile button {
-    min-height: 38px;
-  }
-  .panel {
-    border-radius: 14px;
-  }
-  .collapse-toggle {
-    min-height: 44px;
-    border-radius: 12px;
-  }
-  .section-body {
-    padding: 10px;
-  }
-  .manager-body {
-    padding: 10px;
-  }
-  .meta .mono {
-    font-size: 0.78rem;
-  }
-  .token-nft-mini {
-    font-size: 0.64rem;
-  }
-  .token-id-copy {
-    font-size: 0.58rem;
-  }
-  .sub-collapse,
-  .section-body,
-  .manager-body,
-  .send-box-body,
-  .collapse-toggle {
-    border-radius: 10px;
-  }
-  .action-sheet-overlay {
-    padding: 8px;
-  }
-  .action-sheet {
-    width: min(640px, 100%);
-    max-height: 92dvh;
-    border-radius: 12px;
-    padding: 10px;
-    backdrop-filter: blur(10px) saturate(125%);
-    -webkit-backdrop-filter: blur(10px) saturate(125%);
-    background: linear-gradient(160deg, rgba(30, 41, 59, 0.95), rgba(15, 23, 42, 0.92));
-    box-shadow: 0 18px 40px rgba(2, 6, 23, 0.52), inset 0 1px 0 rgba(255, 255, 255, 0.16);
-  }
-  .action-sheet-btn {
-    min-height: 40px;
-    font-size: 0.9rem;
-  }
-  .wc-overview-grid {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 6px;
-  }
-  .wc-overview-item {
-    padding: 6px;
-  }
-  .wc-overview-item strong {
-    font-size: 0.74rem;
-    gap: 4px;
-  }
-}
-
-@media (min-width: 860px) {
-  .action-sheet-overlay {
-    padding: 12px;
-  }
-  .action-sheet {
-    width: min(720px, 100%);
-    max-height: min(86dvh, 760px);
-    border-radius: 16px;
-  }
-}
-
-@supports not ((backdrop-filter: blur(2px))) {
-  .panel {
-    background: rgba(15, 23, 42, 0.88);
-  }
-}
-
-@media (min-width: 860px) {
-  .app-shell {
-    padding: 22px 24px 28px;
-    font-size: 15px;
-  }
-  .panel-grid {
-    grid-template-columns: 1.05fr 1fr;
-    gap: 16px;
-  }
-  .panel-wallet {
-    grid-column: 1;
-    grid-row: 2;
-  }
-  .panel-active {
-    grid-column: 1;
-    grid-row: 1;
-  }
-  .panel-tokens {
-    grid-column: 2;
-    grid-row: 1;
-  }
-  .panel-wc {
-    grid-column: 2;
-    grid-row: 2;
-  }
-  button {
-    width: auto;
-    min-width: 140px;
-  }
-  .token-cards {
-    display: block;
-  }
-}
-</style>
+<style scoped src="./styles/app.css"></style>
