@@ -88,7 +88,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div ref="root" class="ui-select">
+  <div ref="root" class="ui-select" :class="{ 'is-open': isOpen }">
     <button
       :id="id"
       type="button"
@@ -124,11 +124,16 @@ onBeforeUnmount(() => {
 .ui-select {
   position: relative;
   width: 100%;
+  z-index: 1;
+}
+
+.ui-select.is-open {
+  z-index: 120;
 }
 
 .ui-select-trigger {
   width: 100%;
-  min-height: 42px;
+  min-height: 34px;
   border: 1px solid rgba(148, 163, 184, 0.4);
   border-radius: 8px;
   background: rgba(15, 23, 42, 0.45);
@@ -137,8 +142,8 @@ onBeforeUnmount(() => {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 10px 12px;
-  font-size: 16px;
+  padding: 6px 8px;
+  font-size: 14px;
   line-height: 1.2;
   text-align: left;
 }
@@ -147,6 +152,12 @@ onBeforeUnmount(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.ui-select.compact-select .ui-select-trigger {
+  min-height: 28px;
+  padding: 4px 6px;
+  font-size: 12px;
 }
 
 .ui-select-caret {
@@ -161,7 +172,7 @@ onBeforeUnmount(() => {
   top: calc(100% + 6px);
   max-height: 280px;
   overflow-y: auto;
-  z-index: 40;
+  z-index: 240;
   border: 1px solid rgba(148, 163, 184, 0.45);
   border-radius: 10px;
   background: rgba(15, 23, 42, 0.96);
@@ -178,14 +189,14 @@ onBeforeUnmount(() => {
 
 .ui-select-option {
   width: 100%;
-  min-height: 42px;
+  min-height: 32px;
   border: 0;
   border-radius: 8px;
   background: transparent;
   color: #e2e8f0;
   text-align: left;
-  padding: 9px 10px;
-  font-size: 16px;
+  padding: 6px 8px;
+  font-size: 14px;
 }
 
 .ui-select-option:hover,
@@ -193,11 +204,17 @@ onBeforeUnmount(() => {
   background: rgba(59, 130, 246, 0.22);
 }
 
+.ui-select.compact-select .ui-select-option {
+  min-height: 28px;
+  padding: 4px 6px;
+  font-size: 12px;
+}
+
 @media (max-width: 460px) {
   .ui-select-trigger,
   .ui-select-option {
-    min-height: 40px;
-    font-size: 16px;
+    min-height: 32px;
+    font-size: 14px;
   }
 }
 </style>

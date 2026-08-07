@@ -11,9 +11,42 @@ import {
 	faLink,
 	faPlug,
 	faXmark,
+	faPaperPlane,
+	faSliders,
+	faBars,
+	faCopy,
+	faAddressCard,
+	faRoute,
+	faKey,
+	faCircleInfo,
+	faTriangleExclamation,
+	faStar,
+	faEye,
+	faEyeSlash,
 } from '@fortawesome/free-solid-svg-icons';
 
-library.add(faCube, faWallet, faPlus, faRotate, faCoins, faLink, faPlug, faXmark);
+library.add(
+	faCube,
+	faWallet,
+	faPlus,
+	faRotate,
+	faCoins,
+	faLink,
+	faPlug,
+	faXmark,
+	faPaperPlane,
+	faSliders,
+	faBars,
+	faCopy,
+	faAddressCard,
+	faRoute,
+	faKey,
+	faCircleInfo,
+	faTriangleExclamation,
+	faStar,
+	faEye,
+	faEyeSlash,
+);
 
 const app = createApp(App);
 app.component('FontAwesomeIcon', FontAwesomeIcon);

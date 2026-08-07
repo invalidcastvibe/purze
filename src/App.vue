@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
-import { BaseWallet, Config, HDWallet, NetworkType, TestNetHDWallet, TestNetWallet, TokenSendRequest, Wallet, convert } from 'mainnet-js';
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { BaseWallet, Config, HDWallet, NetworkType, TestNetHDWallet, TestNetWallet, TokenSendRequest, UnitEnum, Wallet, convert } from 'mainnet-js';
 import { IndexedDBProvider } from '@mainnet-cash/indexeddb-storage';
 import type { IWalletKit, WalletKitTypes } from '@reown/walletkit';
 import { binToHex, encodeLockingBytecodeP2pkh, secp256k1, sha256 } from '@bitauth/libauth';
@@ -9,7 +9,12 @@ import { DERIVATION_PATHS, type DerivationPathType, resolveDerivationPaths } fro
 import UiSelect from './components/UiSelect.vue';
 
 type WalletKind = 'single' | 'hd';
-type SessionMap = Record<string, { peerName: string; accounts: string[] }>;
+type SessionMap = Record<string, {
+  peerName: string;
+  peerUrl?: string;
+  peerIcon?: string;
+  accounts: string[];
+}>;
 
 type ManagedWallet = {
   name: string;
@@ -24,8 +29,21 @@ type TokenSummary = {
   displayName: string;
   decimals: number;
   symbol?: string;
+  iconUri?: string;
   fungibleAmount: bigint;
   nftCount: number;
+};
+
+type TokenMetadata = {
+  name: string;
+  symbol?: string;
+  decimals: number;
+  iconUri?: string;
+};
+
+type UsdRateCache = {
+  rate: number;
+  updatedAt: number;
 };
 
 type ManageWalletDetails = {
@@ -44,7 +62,82 @@ type SelectOption = {
   label: string;
 };
 
+type PendingWcRequest = {
+  topic: string;
+  id: number;
+  method: string;
+  peerName: string;
+  event: WalletKitTypes.SessionRequest;
+};
+
+type PendingWcConnectionProposal = {
+  id: number;
+  appName: string;
+  appUrl?: string;
+  appIcon?: string;
+};
+
+type TokenHistoryItem = {
+  hash: string;
+  timestamp?: number;
+  blockHeight: number;
+  valueChange: number;
+  tokenAmountChanges: {
+    category: string;
+    amount: bigint;
+    nftAmount: bigint;
+  }[];
+};
+
+type TokenSendHistoryRow = {
+  hash: string;
+  timestamp?: number;
+  blockHeight: number;
+  amount: bigint;
+  direction: 'sent' | 'received';
+};
+
+type BchSendHistoryRow = {
+  hash: string;
+  timestamp?: number;
+  blockHeight: number;
+  amountSats: bigint;
+  direction: 'sent' | 'received';
+};
+
+type AssetItem = {
+  key: string;
+  kind: 'bch' | 'token';
+  displayName: string;
+  symbol?: string;
+  iconUri?: string;
+  usdValueText: string;
+  cauldronPriceText: string;
+  amountText: string;
+  canSend: boolean;
+  nftCount?: number;
+  category?: string;
+  decimals?: number;
+  fungibleAmount?: bigint;
+};
+
+type MobilePanel = 'wallet' | 'tokens' | 'manager' | 'walletconnect';
+type OverlayScreen = 'none' | 'wallet-list' | 'token-list' | 'send-asset' | 'wallet-connect' | 'manage-wallet' | 'create-import' | 'about' | 'receive';
+
 const WALLETCONNECT_PROJECT_ID = '3fd234b8e2cd0e1da4bc08a0011bbf64';
+const TOKEN_NAME_CACHE_STORAGE_KEY = 'slim.tokenNameCache.v2';
+const USD_RATE_CACHE_STORAGE_KEY = 'slim.usdRateCache.v1';
+const HIDDEN_TOKEN_CATEGORIES_STORAGE_KEY = 'slim.hiddenTokenCategories.v1';
+const FAVORITE_TOKEN_CATEGORIES_STORAGE_KEY = 'slim.favoriteTokenCategories.v1';
+const IPFS_GATEWAY = 'https://dweb.link/ipfs/';
+const MAX_TOKEN_NAME_CACHE_ENTRIES = 350;
+const USD_RATE_CACHE_TTL_DESKTOP_MS = 2 * 60 * 1000;
+const USD_RATE_CACHE_TTL_MOBILE_MS = 6 * 60 * 1000;
+
+const walletConnectRuntime = globalThis as typeof globalThis & {
+  __purzeWalletConnectCore?: unknown;
+  __purzeWalletConnectInitPromise?: Promise<IWalletKit>;
+};
 
 const status = ref('Ready');
 const toastMessage = ref('');
@@ -65,13 +158,12 @@ const showSeedPhrase = ref(false);
 const derivationUpdateType = ref<DerivationPathType>('standard');
 const customDerivationPathUpdate = ref('');
 const isUpdatingDerivation = ref(false);
+const showActiveDerivationEditor = ref(false);
 const actionSheetWalletName = ref<string | null>(null);
 const manageWalletDetails = ref<ManageWalletDetails | null>(null);
 const loadingManageWalletDetails = ref(false);
 const manageModalMode = ref<'overview' | 'derivation' | 'backup'>('overview');
-const createImportModalOpen = ref(false);
-const aboutModalOpen = ref(false);
-const receiveModalOpen = ref(false);
+const activeOverlayScreen = ref<OverlayScreen>('none');
 const receiveAddressType = ref<'bch' | 'token'>('bch');
 const receiveQrDataUrl = ref('');
 const isGeneratingReceiveQr = ref(false);
@@ -79,28 +171,47 @@ const managerMode = ref<'none' | 'backup' | 'derivation'>('none');
 
 const bchBalance = ref<bigint>(0n);
 const usdBalance = ref<number | null>(null);
+const bchUsdRate = ref<number | null>(null);
 const walletAddress = ref('');
 const tokenWalletAddress = ref('');
 const tokenList = ref<TokenSummary[]>([]);
-const tokenNameCache = ref<Record<string, { name: string; symbol?: string; decimals: number }>>({});
+const tokenNameCache = ref<Record<string, TokenMetadata>>({});
+const hiddenTokenCategories = ref<Record<string, true>>({});
+const favoriteTokenCategories = ref<Record<string, true>>({});
+const usdRateCache = ref<UsdRateCache | null>(null);
 const sendMode = ref<'bch' | 'token'>('bch');
 const sendToAddress = ref('');
 const sendBchAmount = ref('');
 const sendTokenCategory = ref('');
 const sendTokenAmount = ref('');
+const tokenSendHistory = ref<TokenHistoryItem[]>([]);
+const isLoadingTokenSendHistory = ref(false);
+const tokenSendHistoryError = ref('');
 const isSendingFunds = ref(false);
 const sendCollapsed = ref(true);
 const walletConnectCollapsed = ref(true);
 const tokenListCollapsed = ref(true);
 const isMobileView = ref(false);
+const mobileActivePanel = ref<MobilePanel>('wallet');
+const mobileCompactMode = ref(false);
+const showHiddenTokensInModal = ref(false);
 const walletManagerCollapsed = ref(true);
+const activeWalletSectionEl = ref<HTMLElement | null>(null);
+const tokensSectionEl = ref<HTMLElement | null>(null);
 const walletManagerSectionEl = ref<HTMLElement | null>(null);
+const walletConnectSectionEl = ref<HTMLElement | null>(null);
 const copiedTokenId = ref<string | null>(null);
+const failedAssetIcons = ref<Record<string, true>>({});
+const failedIconUris = ref<Record<string, true>>({});
 let copiedTokenTimer: ReturnType<typeof setTimeout> | null = null;
 
 const wcUri = ref('');
 const walletKit = ref<IWalletKit | null>(null);
 const wcSessions = ref<SessionMap>({});
+const pendingWcRequests = ref<PendingWcRequest[]>([]);
+const pendingWcConnectionProposal = ref<PendingWcConnectionProposal | null>(null);
+const isHandlingWcConnectionProposal = ref(false);
+const isHandlingWcApproval = ref(false);
 
 Config.UseIndexedDBCache = true;
 BaseWallet.StorageProvider = IndexedDBProvider;
@@ -142,7 +253,49 @@ const activeSeedPhrase = computed(() => {
   const w = activeWallet.value as (ActiveWallet & { mnemonic?: string }) | null;
   return w?.mnemonic ?? null;
 });
-const sendableTokens = computed(() => tokenList.value.filter((token) => token.fungibleAmount > 0n));
+
+function isTokenCategoryHidden(category?: string): boolean {
+  return !!category && hiddenTokenCategories.value[category] === true;
+}
+
+function isTokenCategoryFavorite(category?: string): boolean {
+  return !!category && favoriteTokenCategories.value[category] === true;
+}
+
+function sortTokensForDisplay(list: TokenSummary[]): TokenSummary[] {
+  return [...list].sort((left, right) => {
+    const leftFavorite = isTokenCategoryFavorite(left.category);
+    const rightFavorite = isTokenCategoryFavorite(right.category);
+    if (leftFavorite !== rightFavorite) {
+      return leftFavorite ? -1 : 1;
+    }
+    return left.displayName.localeCompare(right.displayName, undefined, { sensitivity: 'base' });
+  });
+}
+
+function toTokenAssetItem(token: TokenSummary): AssetItem {
+  return {
+    key: `asset-token-${token.category}`,
+    kind: 'token',
+    displayName: token.displayName,
+    symbol: token.symbol,
+    iconUri: token.iconUri,
+    usdValueText: '--',
+    cauldronPriceText: 'Cauldron --',
+    amountText: formatTokenAmount(token.fungibleAmount, token.decimals),
+    canSend: token.fungibleAmount > 0n,
+    nftCount: token.nftCount,
+    category: token.category,
+    decimals: token.decimals,
+    fungibleAmount: token.fungibleAmount,
+  };
+}
+
+const visibleTokenList = computed(() => sortTokensForDisplay(tokenList.value.filter((token) => !isTokenCategoryHidden(token.category))));
+const hiddenTokenList = computed(() => sortTokensForDisplay(tokenList.value.filter((token) => isTokenCategoryHidden(token.category))));
+const hiddenTokenCount = computed(() => hiddenTokenList.value.length);
+const hiddenAssetItems = computed<AssetItem[]>(() => hiddenTokenList.value.map((token) => toTokenAssetItem(token)));
+const sendableTokens = computed(() => visibleTokenList.value.filter((token) => token.fungibleAmount > 0n));
 const selectedSendToken = computed(() => sendableTokens.value.find((token) => token.category === sendTokenCategory.value) ?? null);
 const selectedReceiveAddress = computed(() => (receiveAddressType.value === 'token' ? tokenWalletAddress.value : walletAddress.value));
 const sendTokenOptions = computed<SelectOption[]>(() =>
@@ -151,6 +304,71 @@ const sendTokenOptions = computed<SelectOption[]>(() =>
     label: `${token.displayName}${token.symbol ? ` (${token.symbol})` : ''} - ${formatTokenAmount(token.fungibleAmount, token.decimals)}`,
   })),
 );
+const assetItems = computed<AssetItem[]>(() => {
+  if (!activeWallet.value) return [];
+
+  const bchAsset: AssetItem = {
+    key: 'asset-bch',
+    kind: 'bch',
+    displayName: 'Bitcoin Cash',
+    symbol: 'BCH',
+    usdValueText: formatUsdCompact(usdBalance.value),
+    cauldronPriceText: `Cauldron ${formatUsdCompact(bchUsdRate.value)}`,
+    amountText: `${formatBchFromSats(bchBalance.value)} BCH`,
+    canSend: bchBalance.value > 0n,
+  };
+
+  const tokenAssets = visibleTokenList.value.map((token) => toTokenAssetItem(token));
+
+  return [bchAsset, ...tokenAssets];
+});
+const previewAssets = computed(() => assetItems.value.slice(0, 4));
+const currentWalletButtonLabel = computed(() => activeWalletName.value || 'Select Wallet');
+const pendingWcApproval = computed(() => pendingWcRequests.value[0] ?? null);
+const hasPendingWcConnectionProposal = computed(() => pendingWcConnectionProposal.value !== null);
+const hasActiveWcSessions = computed(() => Object.keys(wcSessions.value).length > 0);
+const wcSessionEntries = computed(() => Object.entries(wcSessions.value));
+const wcSessionCount = computed(() => wcSessionEntries.value.length);
+const activeSendAssetLabel = computed(() => {
+  if (sendMode.value === 'bch') return 'Bitcoin Cash (BCH)';
+  const token = selectedSendToken.value;
+  if (!token) return 'CashToken';
+  return `${token.displayName}${token.symbol ? ` (${token.symbol})` : ''}`;
+});
+const selectedTokenSendHistory = computed<TokenSendHistoryRow[]>(() => {
+  const category = sendTokenCategory.value;
+  if (!category) return [];
+
+  return tokenSendHistory.value
+    .map((item) => {
+      const tokenChange = item.tokenAmountChanges.find((change) => change.category === category);
+      if (!tokenChange || tokenChange.amount === 0n) return null;
+      return {
+        hash: item.hash,
+        timestamp: item.timestamp,
+        blockHeight: item.blockHeight,
+        amount: tokenChange.amount,
+        direction: tokenChange.amount < 0n ? 'sent' : 'received',
+      };
+    })
+    .filter((item): item is TokenSendHistoryRow => item !== null)
+    .slice(0, 10);
+});
+const selectedBchSendHistory = computed<BchSendHistoryRow[]>(() => tokenSendHistory.value
+  .map((item) => {
+    const rawValueChange = Math.trunc(item.valueChange ?? 0);
+    if (!Number.isFinite(rawValueChange) || rawValueChange === 0) return null;
+    const amountSats = BigInt(Math.abs(rawValueChange));
+    return {
+      hash: item.hash,
+      timestamp: item.timestamp,
+      blockHeight: item.blockHeight,
+      amountSats,
+      direction: rawValueChange < 0 ? 'sent' : 'received',
+    };
+  })
+  .filter((item): item is BchSendHistoryRow => item !== null)
+  .slice(0, 10));
 
 function onSendModeChange(value: string) {
   sendMode.value = value === 'token' ? 'token' : 'bch';
@@ -167,13 +385,124 @@ function onReceiveAddressTypeChange(value: string) {
   receiveAddressType.value = value === 'token' ? 'token' : 'bch';
 }
 
+function openWalletListModal() {
+  activeOverlayScreen.value = 'wallet-list';
+}
+
+function closeWalletListModal() {
+  if (activeOverlayScreen.value === 'wallet-list') {
+    activeOverlayScreen.value = 'none';
+  }
+}
+
+function openTokenListModal() {
+  activeOverlayScreen.value = 'token-list';
+  if (tokenList.value.length > 0) {
+    void hydrateTokenNames(tokenList.value);
+  }
+}
+
+function closeTokenListModal() {
+  if (activeOverlayScreen.value === 'token-list') {
+    activeOverlayScreen.value = 'none';
+    showHiddenTokensInModal.value = false;
+  }
+}
+
+function openWalletConnectModal() {
+  activeOverlayScreen.value = 'wallet-connect';
+}
+
+function closeWalletConnectModal() {
+  if (activeOverlayScreen.value === 'wallet-connect') {
+    activeOverlayScreen.value = 'none';
+  }
+}
+
+function openSendAssetModalForBch() {
+  sendMode.value = 'bch';
+  sendTokenCategory.value = '';
+  sendToAddress.value = '';
+  sendBchAmount.value = '';
+  sendTokenAmount.value = '';
+  tokenSendHistoryError.value = '';
+  activeOverlayScreen.value = 'send-asset';
+  void loadTokenSendHistory();
+}
+
+function openSendAssetModalForToken(category: string) {
+  sendMode.value = 'token';
+  sendTokenCategory.value = category;
+  sendToAddress.value = '';
+  sendBchAmount.value = '';
+  sendTokenAmount.value = '';
+  tokenSendHistoryError.value = '';
+  activeOverlayScreen.value = 'send-asset';
+  void loadTokenSendHistory();
+}
+
+function openSendAssetModal(asset: AssetItem) {
+  if (asset.kind === 'bch') {
+    openSendAssetModalForBch();
+    return;
+  }
+  if (!asset.category) return;
+  openSendAssetModalForToken(asset.category);
+}
+
+function closeSendAssetModal() {
+  if (activeOverlayScreen.value === 'send-asset') {
+    activeOverlayScreen.value = 'none';
+  }
+}
+
 function updateViewportState() {
   isMobileView.value = window.innerWidth < 860;
   if (!isMobileView.value) {
     sendCollapsed.value = false;
     walletConnectCollapsed.value = false;
     tokenListCollapsed.value = false;
+  } else {
+    walletManagerCollapsed.value = true;
   }
+}
+
+async function setMobileActivePanel(panel: MobilePanel) {
+  mobileActivePanel.value = panel;
+  let targetEl: HTMLElement | null = activeWalletSectionEl.value;
+  if (panel === 'tokens') {
+    tokenListCollapsed.value = false;
+    targetEl = tokensSectionEl.value;
+  }
+  if (panel === 'walletconnect') {
+    walletConnectCollapsed.value = false;
+    targetEl = walletConnectSectionEl.value;
+  }
+  if (panel === 'manager') {
+    walletManagerCollapsed.value = false;
+    targetEl = walletManagerSectionEl.value;
+  }
+
+  await nextTick();
+  targetEl?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function toggleWalletManagerCollapsed() {
+  walletManagerCollapsed.value = !walletManagerCollapsed.value;
+  if (!walletManagerCollapsed.value) {
+    mobileActivePanel.value = 'manager';
+  }
+}
+
+function toggleMobileCompactMode() {
+  mobileCompactMode.value = !mobileCompactMode.value;
+}
+
+function mobilePanelLabel(panel: MobilePanel) {
+  if (panel === 'tokens') return 'Tokens';
+  if (panel === 'manager') return 'Wallet Manager';
+  if (panel === 'walletconnect') return 'WalletConnect';
+  return 'Active Wallet';
 }
 
 function toggleSendCollapsed() {
@@ -220,6 +549,58 @@ function resetSendForm() {
   sendTokenAmount.value = '';
 }
 
+function formatHistoryTxHash(hash: string): string {
+  if (!hash) return '';
+  if (hash.length <= 22) return hash;
+  return `${hash.slice(0, 10)}...${hash.slice(-8)}`;
+}
+
+function formatHistoryTimestamp(timestamp?: number, blockHeight?: number): string {
+  if (!timestamp) {
+    return typeof blockHeight === 'number' && blockHeight <= 0 ? 'Pending confirmation' : 'Confirmed';
+  }
+
+  const date = new Date(timestamp * 1000);
+  if (Number.isNaN(date.getTime())) {
+    return typeof blockHeight === 'number' && blockHeight <= 0 ? 'Pending confirmation' : 'Confirmed';
+  }
+  return `${date.toLocaleDateString()} ${date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
+}
+
+function openTokenHistoryTransaction(hash: string) {
+  if (!hash) return;
+  const url = `https://blockchair.com/bitcoin-cash/transaction/${hash}`;
+  window.open(url, '_blank', 'noopener,noreferrer');
+}
+
+async function loadTokenSendHistory() {
+  if (!activeWallet.value) {
+    tokenSendHistory.value = [];
+    tokenSendHistoryError.value = '';
+    isLoadingTokenSendHistory.value = false;
+    return;
+  }
+
+  if (sendMode.value === 'token' && !sendTokenCategory.value) {
+    tokenSendHistory.value = [];
+    tokenSendHistoryError.value = '';
+    isLoadingTokenSendHistory.value = false;
+    return;
+  }
+
+  isLoadingTokenSendHistory.value = true;
+  tokenSendHistoryError.value = '';
+  try {
+    const history = await activeWallet.value.getHistory({ unit: UnitEnum.SAT, count: 80 });
+    tokenSendHistory.value = (history ?? []) as TokenHistoryItem[];
+  } catch (error) {
+    tokenSendHistory.value = [];
+    tokenSendHistoryError.value = error instanceof Error ? error.message : 'Unable to load token transaction history';
+  } finally {
+    isLoadingTokenSendHistory.value = false;
+  }
+}
+
 async function sendBch() {
   if (!activeWallet.value) {
     status.value = 'No active wallet selected';
@@ -242,6 +623,7 @@ async function sendBch() {
     const { txId } = await activeWallet.value.send([{ cashaddr, value: sats }]);
     status.value = txId ? `BCH sent. TxId: ${txId}` : 'BCH sent';
     resetSendForm();
+    closeSendAssetModal();
     await refreshBalancesAndTokens();
   } catch (error) {
     status.value = error instanceof Error ? error.message : 'Failed to send BCH';
@@ -289,6 +671,7 @@ async function sendCashToken() {
     ]);
     status.value = txId ? `CashToken sent. TxId: ${txId}` : 'CashToken sent';
     resetSendForm();
+    closeSendAssetModal();
     await refreshBalancesAndTokens();
   } catch (error) {
     status.value = error instanceof Error ? error.message : 'Failed to send CashToken';
@@ -310,9 +693,139 @@ function fallbackTokenName(category: string): string {
   return `Token ${category.slice(0, 8)}`;
 }
 
+function loadPersistedClientCaches() {
+  try {
+    const rawTokenCache = localStorage.getItem(TOKEN_NAME_CACHE_STORAGE_KEY);
+    if (rawTokenCache) {
+      const parsed = JSON.parse(rawTokenCache) as Record<string, TokenMetadata>;
+      if (parsed && typeof parsed === 'object') {
+        tokenNameCache.value = parsed;
+      }
+    }
+  } catch {
+    tokenNameCache.value = {};
+  }
+
+  try {
+    const rawUsdRateCache = localStorage.getItem(USD_RATE_CACHE_STORAGE_KEY);
+    if (rawUsdRateCache) {
+      const parsed = JSON.parse(rawUsdRateCache) as UsdRateCache;
+      if (typeof parsed?.rate === 'number' && typeof parsed?.updatedAt === 'number') {
+        usdRateCache.value = parsed;
+      }
+    }
+  } catch {
+    usdRateCache.value = null;
+  }
+
+  try {
+    const rawHiddenCategories = localStorage.getItem(HIDDEN_TOKEN_CATEGORIES_STORAGE_KEY);
+    if (rawHiddenCategories) {
+      const parsed = JSON.parse(rawHiddenCategories) as string[];
+      if (Array.isArray(parsed)) {
+        hiddenTokenCategories.value = Object.fromEntries(parsed.filter((value) => typeof value === 'string').map((value) => [value, true]));
+      }
+    }
+  } catch {
+    hiddenTokenCategories.value = {};
+  }
+
+  try {
+    const rawFavoriteCategories = localStorage.getItem(FAVORITE_TOKEN_CATEGORIES_STORAGE_KEY);
+    if (rawFavoriteCategories) {
+      const parsed = JSON.parse(rawFavoriteCategories) as string[];
+      if (Array.isArray(parsed)) {
+        favoriteTokenCategories.value = Object.fromEntries(parsed.filter((value) => typeof value === 'string').map((value) => [value, true]));
+      }
+    }
+  } catch {
+    favoriteTokenCategories.value = {};
+  }
+}
+
+function persistTokenNameCache() {
+  const entries = Object.entries(tokenNameCache.value);
+  const boundedEntries = entries.slice(-MAX_TOKEN_NAME_CACHE_ENTRIES);
+  tokenNameCache.value = Object.fromEntries(boundedEntries);
+  localStorage.setItem(TOKEN_NAME_CACHE_STORAGE_KEY, JSON.stringify(tokenNameCache.value));
+}
+
+function persistUsdRateCache() {
+  if (!usdRateCache.value) return;
+  localStorage.setItem(USD_RATE_CACHE_STORAGE_KEY, JSON.stringify(usdRateCache.value));
+}
+
+async function getBchUsdRateWithCache() {
+  const now = Date.now();
+  const ttl = isMobileView.value ? USD_RATE_CACHE_TTL_MOBILE_MS : USD_RATE_CACHE_TTL_DESKTOP_MS;
+  if (usdRateCache.value && now - usdRateCache.value.updatedAt < ttl) {
+    return usdRateCache.value.rate;
+  }
+
+  const nextRate = await convert(1, 'bch', 'usd');
+  usdRateCache.value = { rate: nextRate, updatedAt: now };
+  persistUsdRateCache();
+  return nextRate;
+}
+
 function truncateTokenId(category: string): string {
   if (category.length <= 12) return category;
   return `${category.slice(0, 4)}...${category.slice(-4)}`;
+}
+
+function formatAddressSingleLine(address: string): string {
+  const trimmed = address.trim();
+  if (!trimmed) return '';
+  if (trimmed.length <= 40) return trimmed;
+  return `${trimmed.slice(0, 24)}....${trimmed.slice(-8)}`;
+}
+
+function persistTokenPreferences() {
+  const hiddenCategories = Object.keys(hiddenTokenCategories.value);
+  const favoriteCategories = Object.keys(favoriteTokenCategories.value);
+  localStorage.setItem(HIDDEN_TOKEN_CATEGORIES_STORAGE_KEY, JSON.stringify(hiddenCategories));
+  localStorage.setItem(FAVORITE_TOKEN_CATEGORIES_STORAGE_KEY, JSON.stringify(favoriteCategories));
+}
+
+function toggleFavoriteToken(category: string) {
+  if (!category) return;
+  if (favoriteTokenCategories.value[category]) {
+    const { [category]: _removed, ...rest } = favoriteTokenCategories.value;
+    favoriteTokenCategories.value = rest;
+    status.value = 'Token removed from favorites';
+  } else {
+    favoriteTokenCategories.value = {
+      ...favoriteTokenCategories.value,
+      [category]: true,
+    };
+    status.value = 'Token added to favorites';
+  }
+  persistTokenPreferences();
+}
+
+function hideToken(category: string) {
+  if (!category || hiddenTokenCategories.value[category]) return;
+  hiddenTokenCategories.value = {
+    ...hiddenTokenCategories.value,
+    [category]: true,
+  };
+  persistTokenPreferences();
+  if (sendTokenCategory.value === category) {
+    sendTokenCategory.value = sendableTokens.value[0]?.category ?? '';
+  }
+  status.value = 'Token hidden from your default list';
+}
+
+function unhideToken(category: string) {
+  if (!category || !hiddenTokenCategories.value[category]) return;
+  const { [category]: _removed, ...rest } = hiddenTokenCategories.value;
+  hiddenTokenCategories.value = rest;
+  persistTokenPreferences();
+  status.value = 'Token restored to your list';
+}
+
+function toggleShowHiddenTokensInModal() {
+  showHiddenTokensInModal.value = !showHiddenTokensInModal.value;
 }
 
 async function copyTokenId(category: string) {
@@ -348,7 +861,45 @@ function formatTokenAmount(amount: bigint, decimals: number): string {
   return `${whole.toString()}.${fractionText}`;
 }
 
-async function fetchTokenName(category: string): Promise<{ name: string; symbol?: string; decimals: number }> {
+function resolveMetadataIconUri(candidate?: string): string | undefined {
+  if (!candidate) return undefined;
+  const value = candidate.trim();
+  if (!value) return undefined;
+  if (value.startsWith('//')) {
+    return `https:${value}`;
+  }
+  if (value.startsWith('ipfs://')) {
+    return `${IPFS_GATEWAY}${value.slice('ipfs://'.length)}`;
+  }
+  if (value.startsWith('/ipfs/')) {
+    return `${IPFS_GATEWAY}${value.slice('/ipfs/'.length)}`;
+  }
+  if (value.startsWith('http://') || value.startsWith('https://')) {
+    return value;
+  }
+  return undefined;
+}
+
+function isAssetIconVisible(asset: AssetItem): boolean {
+  if (!asset.iconUri) return false;
+  if (failedIconUris.value[asset.iconUri]) return false;
+  return failedAssetIcons.value[asset.key] !== true;
+}
+
+function onAssetIconError(assetKey: string, assetIconUri?: string) {
+  failedAssetIcons.value = {
+    ...failedAssetIcons.value,
+    [assetKey]: true,
+  };
+  if (assetIconUri) {
+    failedIconUris.value = {
+      ...failedIconUris.value,
+      [assetIconUri]: true,
+    };
+  }
+}
+
+async function fetchTokenName(category: string): Promise<TokenMetadata> {
   const cached = tokenNameCache.value[category];
   if (cached) return cached;
 
@@ -360,6 +911,8 @@ async function fetchTokenName(category: string): Promise<{ name: string; symbol?
     const data = (await res.json()) as {
       error?: string;
       name?: string;
+      uris?: Record<string, string | undefined>;
+      identity?: { uris?: Record<string, string | undefined> };
       token?: { symbol?: string; decimals?: number };
     };
     if (data.error) return fallback;
@@ -369,7 +922,14 @@ async function fetchTokenName(category: string): Promise<{ name: string; symbol?
     const decimals = typeof data.token?.decimals === 'number' && data.token.decimals >= 0
       ? Math.floor(data.token.decimals)
       : 0;
-    const result = symbol ? { name, symbol, decimals } : { name, decimals };
+    const rawIconUri = data.uris?.image
+      ?? data.uris?.icon
+      ?? data.identity?.uris?.image
+      ?? data.identity?.uris?.icon;
+    const iconUri = resolveMetadataIconUri(rawIconUri);
+    const result = symbol
+      ? { name, symbol, decimals, ...(iconUri ? { iconUri } : {}) }
+      : { name, decimals, ...(iconUri ? { iconUri } : {}) };
     tokenNameCache.value[category] = result;
     return result;
   } catch {
@@ -377,14 +937,32 @@ async function fetchTokenName(category: string): Promise<{ name: string; symbol?
   }
 }
 
+function hasMissingTokenMetadata(list: TokenSummary[]) {
+  return list.some((token) => !tokenNameCache.value[token.category]);
+}
+
 async function hydrateTokenNames(list: TokenSummary[]) {
-  const names = await Promise.all(list.map((token) => fetchTokenName(token.category)));
-  tokenList.value = list.map((token, i) => {
-    const nextName = names[i];
+  const missingCategories = list
+    .map((token) => token.category)
+    .filter((category) => !tokenNameCache.value[category]);
+
+  if (missingCategories.length > 0) {
+    await Promise.all(missingCategories.map((category) => fetchTokenName(category)));
+    persistTokenNameCache();
+  }
+
+  tokenList.value = list.map((token) => {
+    const nextName = tokenNameCache.value[token.category];
     const nextSymbol = nextName?.symbol;
+    const nextIconUri = nextName?.iconUri;
     return nextSymbol
-      ? { ...token, displayName: nextName.name, symbol: nextSymbol, decimals: nextName.decimals }
-      : { ...token, displayName: nextName?.name ?? token.displayName, decimals: nextName?.decimals ?? token.decimals };
+      ? { ...token, displayName: nextName.name, symbol: nextSymbol, iconUri: nextIconUri, decimals: nextName.decimals }
+      : {
+        ...token,
+        displayName: nextName?.name ?? token.displayName,
+        iconUri: nextIconUri,
+        decimals: nextName?.decimals ?? token.decimals,
+      };
   });
 }
 
@@ -395,6 +973,11 @@ function formatBchFromSats(sats: bigint): string {
 
 function formatUsd(value: number | null): string {
   if (value === null || Number.isNaN(value)) return 'Not available';
+  return value.toLocaleString(undefined, { style: 'currency', currency: 'USD', maximumFractionDigits: 2 });
+}
+
+function formatUsdCompact(value: number | null): string {
+  if (value === null || Number.isNaN(value)) return '--';
   return value.toLocaleString(undefined, { style: 'currency', currency: 'USD', maximumFractionDigits: 2 });
 }
 
@@ -433,6 +1016,7 @@ function getWalletMeta(name: string) {
 async function onActiveWalletChange(value: string) {
   activeWalletName.value = value;
   await loadActiveWallet(value);
+  closeWalletListModal();
   status.value = `Active wallet switched to ${value}. Balances and tokens refreshed.`;
 }
 
@@ -496,6 +1080,24 @@ function onDerivationUpdateTypeChange(value: string) {
   derivationUpdateType.value = 'standard';
 }
 
+async function onDerivationUpdateTypeChangeAndApply(value: string) {
+  onDerivationUpdateTypeChange(value);
+  if (derivationUpdateType.value === 'custom' || isUpdatingDerivation.value) {
+    return;
+  }
+  await updateActiveWalletDerivationPath();
+}
+
+async function applyCustomDerivationIfValid() {
+  if (derivationUpdateType.value !== 'custom' || isUpdatingDerivation.value) {
+    return;
+  }
+  if (!customDerivationPathUpdate.value.trim()) {
+    return;
+  }
+  await updateActiveWalletDerivationPath();
+}
+
 function getWalletDerivationString(wallet: ActiveWallet): string {
   if ('derivationPath' in wallet) return (wallet as { derivationPath: string }).derivationPath;
   if ('derivation' in wallet) return (wallet as { derivation: string }).derivation;
@@ -523,6 +1125,7 @@ async function loadActiveWallet(name: string) {
   tokenWalletAddress.value = wallet.getTokenDepositAddress();
   showSeedPhrase.value = false;
   managerMode.value = 'none';
+  showActiveDerivationEditor.value = false;
   syncDerivationEditorFromActiveWallet();
   await refreshBalancesAndTokens();
   await syncSessionAddresses();
@@ -571,6 +1174,7 @@ async function loadManageWalletDetails(walletName: string) {
 function openWalletActionSheet(walletName: string) {
   actionSheetWalletName.value = walletName;
   manageModalMode.value = 'overview';
+  activeOverlayScreen.value = 'manage-wallet';
   void loadManageWalletDetails(walletName);
 }
 
@@ -579,22 +1183,29 @@ function closeWalletActionSheet() {
   manageWalletDetails.value = null;
   loadingManageWalletDetails.value = false;
   manageModalMode.value = 'overview';
+  if (activeOverlayScreen.value === 'manage-wallet') {
+    activeOverlayScreen.value = 'none';
+  }
 }
 
 function openCreateImportModal() {
-  createImportModalOpen.value = true;
+  activeOverlayScreen.value = 'create-import';
 }
 
 function closeCreateImportModal() {
-  createImportModalOpen.value = false;
+  if (activeOverlayScreen.value === 'create-import') {
+    activeOverlayScreen.value = 'none';
+  }
 }
 
 function openAboutModal() {
-  aboutModalOpen.value = true;
+  activeOverlayScreen.value = 'about';
 }
 
 function closeAboutModal() {
-  aboutModalOpen.value = false;
+  if (activeOverlayScreen.value === 'about') {
+    activeOverlayScreen.value = 'none';
+  }
 }
 
 async function renderReceiveQr() {
@@ -625,12 +1236,14 @@ async function renderReceiveQr() {
 
 async function openReceiveModal() {
   receiveAddressType.value = 'bch';
-  receiveModalOpen.value = true;
+  activeOverlayScreen.value = 'receive';
   await renderReceiveQr();
 }
 
 function closeReceiveModal() {
-  receiveModalOpen.value = false;
+  if (activeOverlayScreen.value === 'receive') {
+    activeOverlayScreen.value = 'none';
+  }
 }
 
 async function copyText(text: string, label: string) {
@@ -668,6 +1281,19 @@ async function openManageBackup() {
   if (!ok) return;
   showSeedPhrase.value = false;
   manageModalMode.value = 'backup';
+}
+
+function toggleActiveWalletDerivationEditor() {
+  if (!activeWalletName.value || !activeWallet.value) {
+    status.value = 'No active wallet selected';
+    return;
+  }
+
+  if (!showActiveDerivationEditor.value) {
+    syncDerivationEditorFromActiveWallet();
+  }
+
+  showActiveDerivationEditor.value = !showActiveDerivationEditor.value;
 }
 
 async function deleteWalletFromDb(name: string, dbName: 'bitcoincash' | 'bchtest') {
@@ -736,17 +1362,130 @@ async function openWalletManagerAction(walletName: string, action: 'backup' | 'd
   if (activeWalletName.value !== walletName) {
     await loadActiveWallet(walletName);
   }
-
-  walletManagerCollapsed.value = false;
+  actionSheetWalletName.value = walletName;
+  activeOverlayScreen.value = 'manage-wallet';
   managerMode.value = action;
   showSeedPhrase.value = action === 'backup';
+  manageModalMode.value = action === 'backup' ? 'backup' : 'derivation';
+  void loadManageWalletDetails(walletName);
   if (action === 'derivation') {
     syncDerivationEditorFromActiveWallet();
   }
+}
 
-  requestAnimationFrame(() => {
-    walletManagerSectionEl.value?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+function enqueueWcApproval(event: WalletKitTypes.SessionRequest) {
+  const topic = event.topic;
+  const sessions = walletKit.value?.getActiveSessions();
+  const peerName = sessions?.[topic]?.peer?.metadata?.name ?? 'Unknown dApp';
+  pendingWcRequests.value.push({
+    topic,
+    id: event.id,
+    method: event.params.request.method,
+    peerName,
+    event,
   });
+}
+
+async function executeWalletConnectRequest(event: WalletKitTypes.SessionRequest) {
+  if (!walletKit.value || !activeWallet.value) return;
+  const { topic, id, params } = event;
+  const method = params.request.method;
+
+  switch (method) {
+    case 'bch_getAddresses':
+    case 'bch_getAccounts': {
+      const result = [walletAddress.value];
+      await walletKit.value.respondSessionRequest({ topic, response: { id, jsonrpc: '2.0', result } });
+      break;
+    }
+    case 'bch_signMessage':
+    case 'personal_sign': {
+      const req = params.request.params as WcSignMessageRequest;
+      const signingInfo = getSigningInfo(topic);
+      const signed = activeWallet.value.sign(req.message, signingInfo.privateKey);
+      await walletKit.value.respondSessionRequest({
+        topic,
+        response: { id, jsonrpc: '2.0', result: signed.signature },
+      });
+      break;
+    }
+    case 'bch_signTransaction': {
+      const [{ parseExtendedJson }, { createSignedWcTransaction }] = await Promise.all([
+        import('./lib/extendedJson'),
+        import('./lib/wcSigning'),
+      ]);
+      const parsed = parseExtendedJson(JSON.stringify(params.request.params)) as WcSignTransactionRequest;
+      const signingInfo = getSigningInfo(topic);
+      const walletLockingBytecodeHex = binToHex(encodeLockingBytecodeP2pkh(signingInfo.publicKeyHash));
+      const encodedTransaction = createSignedWcTransaction(parsed, signingInfo, walletLockingBytecodeHex);
+      const txHash = binToHex(sha256.hash(sha256.hash(encodedTransaction)).reverse());
+      const result = {
+        signedTransaction: binToHex(encodedTransaction),
+        signedTransactionHash: txHash,
+      };
+
+      if (parsed.broadcast) {
+        await activeWallet.value.submitTransaction(encodedTransaction);
+      }
+
+      await walletKit.value.respondSessionRequest({ topic, response: { id, jsonrpc: '2.0', result } });
+      break;
+    }
+    default: {
+      await walletKit.value.respondSessionRequest({
+        topic,
+        response: {
+          id,
+          jsonrpc: '2.0',
+          error: { code: 1001, message: `Unsupported method ${method}` },
+        },
+      });
+    }
+  }
+}
+
+async function approvePendingWcRequest() {
+  if (!walletKit.value || !pendingWcApproval.value || isHandlingWcApproval.value) return;
+  isHandlingWcApproval.value = true;
+  const current = pendingWcApproval.value;
+  try {
+    await executeWalletConnectRequest(current.event);
+    pendingWcRequests.value = pendingWcRequests.value.filter((req) => !(req.topic === current.topic && req.id === current.id));
+    status.value = `Approved WalletConnect request: ${current.method}`;
+  } catch (error) {
+    await walletKit.value.respondSessionRequest({
+      topic: current.topic,
+      response: {
+        id: current.id,
+        jsonrpc: '2.0',
+        error: { code: 7, message: error instanceof Error ? error.message : 'Request failed' },
+      },
+    });
+    pendingWcRequests.value = pendingWcRequests.value.filter((req) => !(req.topic === current.topic && req.id === current.id));
+    status.value = `WalletConnect error on ${current.method}`;
+  } finally {
+    isHandlingWcApproval.value = false;
+  }
+}
+
+async function rejectPendingWcRequest() {
+  if (!walletKit.value || !pendingWcApproval.value || isHandlingWcApproval.value) return;
+  isHandlingWcApproval.value = true;
+  const current = pendingWcApproval.value;
+  try {
+    await walletKit.value.respondSessionRequest({
+      topic: current.topic,
+      response: {
+        id: current.id,
+        jsonrpc: '2.0',
+        error: { code: 4001, message: 'User rejected the request' },
+      },
+    });
+    pendingWcRequests.value = pendingWcRequests.value.filter((req) => !(req.topic === current.topic && req.id === current.id));
+    status.value = `Rejected WalletConnect request: ${current.method}`;
+  } finally {
+    isHandlingWcApproval.value = false;
+  }
 }
 
 async function updateActiveWalletDerivationPath() {
@@ -782,6 +1521,7 @@ async function updateActiveWalletDerivationPath() {
     await loadActiveWallet(name);
     await refreshBalancesAndTokens();
     closeWalletActionSheet();
+    showActiveDerivationEditor.value = false;
     status.value = 'Derivation path updated and wallet reloaded';
   } catch (error) {
     status.value = error instanceof Error ? error.message : 'Failed to update derivation path';
@@ -859,10 +1599,12 @@ async function refreshBalancesAndTokens() {
     .reduce((sum, u) => sum + u.satoshis, 0n);
 
   try {
-    const oneBchInUsd = await convert(1, 'bch', 'usd');
+    const oneBchInUsd = await getBchUsdRateWithCache();
+    bchUsdRate.value = oneBchInUsd;
     const balanceBch = Number(bchBalance.value) / 100_000_000;
     usdBalance.value = balanceBch * oneBchInUsd;
   } catch {
+    bchUsdRate.value = null;
     usdBalance.value = null;
   }
 
@@ -887,6 +1629,7 @@ async function refreshBalancesAndTokens() {
   }
   const nextTokenList = [...tokenMap.values()];
   tokenList.value = nextTokenList;
+  failedAssetIcons.value = {};
   if (!sendableTokens.value.some((token) => token.category === sendTokenCategory.value)) {
     sendTokenCategory.value = sendableTokens.value[0]?.category ?? '';
   }
@@ -938,63 +1681,20 @@ function getSigningInfo(topic: string) {
 async function handleSessionRequest(event: WalletKitTypes.SessionRequest) {
   if (!walletKit.value || !activeWallet.value) return;
 
-  const { topic, id, params } = event;
-  const method = params.request.method;
+  const method = event.params.request.method;
+  const requiresApproval = method === 'bch_signTransaction' || method === 'bch_signMessage' || method === 'personal_sign';
+
+  if (requiresApproval) {
+    enqueueWcApproval(event);
+    status.value = `Approval required: ${method}`;
+    return;
+  }
 
   try {
-    switch (method) {
-      case 'bch_getAddresses':
-      case 'bch_getAccounts': {
-        const result = [walletAddress.value];
-        await walletKit.value.respondSessionRequest({ topic, response: { id, jsonrpc: '2.0', result } });
-        break;
-      }
-      case 'bch_signMessage':
-      case 'personal_sign': {
-        const req = params.request.params as WcSignMessageRequest;
-        const signingInfo = getSigningInfo(topic);
-        const signed = activeWallet.value.sign(req.message, signingInfo.privateKey);
-        await walletKit.value.respondSessionRequest({
-          topic,
-          response: { id, jsonrpc: '2.0', result: signed.signature },
-        });
-        break;
-      }
-      case 'bch_signTransaction': {
-        const [{ parseExtendedJson }, { createSignedWcTransaction }] = await Promise.all([
-          import('./lib/extendedJson'),
-          import('./lib/wcSigning'),
-        ]);
-        const parsed = parseExtendedJson(JSON.stringify(params.request.params)) as WcSignTransactionRequest;
-        const signingInfo = getSigningInfo(topic);
-        const walletLockingBytecodeHex = binToHex(encodeLockingBytecodeP2pkh(signingInfo.publicKeyHash));
-        const encodedTransaction = createSignedWcTransaction(parsed, signingInfo, walletLockingBytecodeHex);
-        const txHash = binToHex(sha256.hash(sha256.hash(encodedTransaction)).reverse());
-        const result = {
-          signedTransaction: binToHex(encodedTransaction),
-          signedTransactionHash: txHash,
-        };
-
-        if (parsed.broadcast) {
-          await activeWallet.value.submitTransaction(encodedTransaction);
-        }
-
-        await walletKit.value.respondSessionRequest({ topic, response: { id, jsonrpc: '2.0', result } });
-        break;
-      }
-      default: {
-        await walletKit.value.respondSessionRequest({
-          topic,
-          response: {
-            id,
-            jsonrpc: '2.0',
-            error: { code: 1001, message: `Unsupported method ${method}` },
-          },
-        });
-      }
-    }
+    await executeWalletConnectRequest(event);
     status.value = `Handled WalletConnect request: ${method}`;
   } catch (error) {
+    const { topic, id } = event;
     await walletKit.value.respondSessionRequest({
       topic,
       response: {
@@ -1007,6 +1707,54 @@ async function handleSessionRequest(event: WalletKitTypes.SessionRequest) {
   }
 }
 
+function getWalletConnectNamespaces() {
+  if (!activeWallet.value || !walletAddress.value) {
+    throw new Error('No active wallet selected.');
+  }
+  const chain = activeWallet.value.network === NetworkType.Mainnet ? 'bch:bitcoincash' : 'bch:bchtest';
+  return {
+    bch: {
+      methods: ['bch_getAddresses', 'bch_signTransaction', 'bch_signMessage', 'bch_cancelPendingRequests'],
+      chains: [chain],
+      events: ['addressesChanged'],
+      accounts: [`bch:${walletAddress.value}`],
+    },
+  };
+}
+
+async function approvePendingWcConnectionProposal() {
+  if (!walletKit.value || !pendingWcConnectionProposal.value || isHandlingWcConnectionProposal.value) return;
+  isHandlingWcConnectionProposal.value = true;
+  const proposal = pendingWcConnectionProposal.value;
+  try {
+    const namespaces = getWalletConnectNamespaces();
+    await walletKit.value.approveSession({ id: proposal.id, namespaces });
+    pendingWcConnectionProposal.value = null;
+    refreshSessionMap();
+    status.value = `WalletConnect approved for ${proposal.appName}`;
+  } catch (error) {
+    status.value = error instanceof Error ? error.message : 'Failed to approve WalletConnect connection';
+  } finally {
+    isHandlingWcConnectionProposal.value = false;
+  }
+}
+
+async function rejectPendingWcConnectionProposal() {
+  if (!walletKit.value || !pendingWcConnectionProposal.value || isHandlingWcConnectionProposal.value) return;
+  isHandlingWcConnectionProposal.value = true;
+  const proposal = pendingWcConnectionProposal.value;
+  try {
+    await walletKit.value.rejectSession({
+      id: proposal.id,
+      reason: { code: 5000, message: 'User rejected connection.' },
+    });
+    pendingWcConnectionProposal.value = null;
+    status.value = `WalletConnect connection rejected for ${proposal.appName}`;
+  } finally {
+    isHandlingWcConnectionProposal.value = false;
+  }
+}
+
 function refreshSessionMap() {
   if (!walletKit.value) {
     wcSessions.value = {};
@@ -1016,8 +1764,11 @@ function refreshSessionMap() {
   const result: SessionMap = {};
 
   for (const [topic, session] of Object.entries(sessions)) {
+    const metadata = session.peer?.metadata;
     result[topic] = {
-      peerName: session.peer.metadata.name,
+      peerName: metadata?.name || 'Unknown dApp',
+      peerUrl: metadata?.url,
+      peerIcon: metadata?.icons?.[0],
       accounts: session.namespaces.bch?.accounts ?? [],
     };
   }
@@ -1025,23 +1776,44 @@ function refreshSessionMap() {
   wcSessions.value = result;
 }
 
+function getDisplayHost(url?: string): string {
+  if (!url) return 'Unknown origin';
+  try {
+    const parsed = new URL(url);
+    return parsed.hostname || url;
+  } catch {
+    return url;
+  }
+}
+
 async function syncSessionAddresses() {
   if (!walletKit.value || !walletAddress.value) return;
   const sessions = walletKit.value.getActiveSessions();
+  const chain = activeWallet.value?.network === NetworkType.Mainnet ? 'bch:bitcoincash' : 'bch:bchtest';
+  const account = `bch:${walletAddress.value}`;
 
   for (const [topic, session] of Object.entries(sessions)) {
-    const chain = activeWallet.value?.network === NetworkType.Mainnet ? 'bch:bitcoincash' : 'bch:bchtest';
     const namespaces = {
       ...session.namespaces,
       bch: {
         methods: ['bch_getAddresses', 'bch_signTransaction', 'bch_signMessage', 'bch_cancelPendingRequests'],
         events: ['addressesChanged'],
         chains: [chain],
-        accounts: [`bch:${walletAddress.value}`],
+        accounts: [account],
       },
     };
 
     await walletKit.value.updateSession({ topic, namespaces });
+
+    // Tell connected dApps to refresh their displayed account after a wallet switch.
+    await walletKit.value.emitSessionEvent({
+      topic,
+      chainId: chain,
+      event: {
+        name: 'addressesChanged',
+        data: [account],
+      },
+    });
   }
 
   refreshSessionMap();
@@ -1050,49 +1822,84 @@ async function syncSessionAddresses() {
 async function initWalletConnect() {
   if (walletKit.value) return;
 
-  const [{ Core }, walletKitModule] = await Promise.all([
-    import('@walletconnect/core'),
-    import('@reown/walletkit'),
-  ]);
-  const { WalletKit } = walletKitModule;
-  const core = new Core({ projectId: WALLETCONNECT_PROJECT_ID });
-  const appOrigin = typeof window !== 'undefined' ? window.location.origin : 'https://example.com';
-  const instance = await WalletKit.init({
-    // @ts-expect-error WalletKit expects a stricter ICore relayUrl typing than Core runtime provides.
-    core,
-    metadata: {
-      name: 'Purze BCH Wallet',
-      description: 'Slim BCH wallet',
-      url: appOrigin,
-      icons: [`${appOrigin}/favicon.svg`],
-    },
-  });
+  if (walletConnectRuntime.__purzeWalletConnectInitPromise) {
+    walletKit.value = await walletConnectRuntime.__purzeWalletConnectInitPromise;
+    refreshSessionMap();
+    return;
+  }
 
-  instance.on('session_proposal', async (proposal) => {
-    const chain = activeWallet.value?.network === NetworkType.Mainnet ? 'bch:bitcoincash' : 'bch:bchtest';
-    const namespaces = {
-      bch: {
-        methods: ['bch_getAddresses', 'bch_signTransaction', 'bch_signMessage', 'bch_cancelPendingRequests'],
-        chains: [chain],
-        events: ['addressesChanged'],
-        accounts: [`bch:${walletAddress.value}`],
+  walletConnectRuntime.__purzeWalletConnectInitPromise = (async () => {
+    const [{ Core }, walletKitModule] = await Promise.all([
+      import('@walletconnect/core'),
+      import('@reown/walletkit'),
+    ]);
+    const { WalletKit } = walletKitModule;
+    const core = (walletConnectRuntime.__purzeWalletConnectCore as InstanceType<typeof Core> | undefined)
+      ?? new Core({ projectId: WALLETCONNECT_PROJECT_ID });
+    walletConnectRuntime.__purzeWalletConnectCore = core;
+    const appOrigin = typeof window !== 'undefined' ? window.location.origin : 'https://example.com';
+    const instance = await WalletKit.init({
+      // @ts-expect-error WalletKit expects a stricter ICore relayUrl typing than Core runtime provides.
+      core,
+      metadata: {
+        name: 'Purze BCH Wallet',
+        description: 'Slim BCH wallet',
+        url: appOrigin,
+        icons: [`${appOrigin}/favicon.svg`],
       },
-    };
-    await instance.approveSession({ id: proposal.id, namespaces });
+    });
+
+    instance.on('session_proposal', async (proposal) => {
+      const proposer = proposal.params.proposer.metadata;
+      const appName = proposer?.name || 'Unknown dApp';
+      const appUrl = proposer?.url || 'Unknown origin';
+      const appIcon = proposer?.icons?.[0];
+
+      if (!activeWallet.value || !walletAddress.value) {
+        await instance.rejectSession({
+          id: proposal.id,
+          reason: { code: 5000, message: 'No active wallet selected.' },
+        });
+        status.value = `WalletConnect rejected for ${appName}: no active wallet selected`;
+        return;
+      }
+
+      if (pendingWcConnectionProposal.value) {
+        await instance.rejectSession({
+          id: proposal.id,
+          reason: { code: 5000, message: 'Another connection approval is pending.' },
+        });
+        status.value = `WalletConnect queued request from ${appName} was rejected: approval already pending`;
+        return;
+      }
+
+      pendingWcConnectionProposal.value = {
+        id: proposal.id,
+        appName,
+        appUrl,
+        appIcon,
+      };
+      activeOverlayScreen.value = 'wallet-connect';
+      status.value = `Connection approval required for ${appName}`;
+    });
+
+    instance.on('session_request', (event) => {
+      void handleSessionRequest(event);
+    });
+
+    instance.on('session_delete', () => {
+      refreshSessionMap();
+    });
+
+    return instance;
+  })();
+
+  try {
+    walletKit.value = await walletConnectRuntime.__purzeWalletConnectInitPromise;
     refreshSessionMap();
-    status.value = `WalletConnect approved for ${proposal.params.proposer.metadata.name}`;
-  });
-
-  instance.on('session_request', (event) => {
-    void handleSessionRequest(event);
-  });
-
-  instance.on('session_delete', () => {
-    refreshSessionMap();
-  });
-
-  walletKit.value = instance;
-  refreshSessionMap();
+  } finally {
+    walletConnectRuntime.__purzeWalletConnectInitPromise = undefined;
+  }
 }
 
 async function pairWalletConnect() {
@@ -1119,12 +1926,21 @@ async function disconnectSession(topic: string) {
 }
 
 onMounted(async () => {
+  loadPersistedClientCaches();
   updateViewportState();
   window.addEventListener('resize', updateViewportState);
   loadWallets();
+
+  try {
+    await initWalletConnect();
+  } catch {
+    status.value = 'Failed to initialize WalletConnect';
+  }
+
   if (activeWalletName.value) {
     try {
       await loadActiveWallet(activeWalletName.value);
+      await syncSessionAddresses();
     } catch {
       status.value = 'Failed to load previously active wallet';
     }
@@ -1143,15 +1959,28 @@ watch(status, (value) => {
   }, 3200);
 });
 
-watch([actionSheetWalletName, createImportModalOpen, aboutModalOpen, receiveModalOpen], ([manageModal, createModal, aboutModal, receiveModal]) => {
-  const lockScroll = Boolean(manageModal) || Boolean(createModal) || Boolean(aboutModal) || Boolean(receiveModal);
+watch(activeOverlayScreen, (screen) => {
+  const lockScroll = screen !== 'none';
   document.body.style.overflow = lockScroll ? 'hidden' : '';
   document.documentElement.style.overflow = lockScroll ? 'hidden' : '';
 });
 
-watch([receiveModalOpen, receiveAddressType, walletAddress, tokenWalletAddress], ([open]) => {
-  if (!open) return;
+watch([activeOverlayScreen, receiveAddressType, walletAddress, tokenWalletAddress], ([screen]) => {
+  if (screen !== 'receive') return;
   void renderReceiveQr();
+});
+
+watch([activeOverlayScreen, sendMode, sendTokenCategory, activeWalletName], ([screen, mode]) => {
+  if (screen !== 'send-asset') return;
+  if (mode === 'token' && !sendTokenCategory.value) return;
+  void loadTokenSendHistory();
+});
+
+watch([tokenListCollapsed, isMobileView, tokenList], ([collapsed, isMobile, list]) => {
+  if (list.length === 0) return;
+  const shouldHydrateNow = !isMobile || !collapsed;
+  if (!shouldHydrateNow || !hasMissingTokenMetadata(list)) return;
+  void hydrateTokenNames(list);
 });
 
 onBeforeUnmount(() => {
@@ -1166,292 +1995,701 @@ onBeforeUnmount(() => {
 
 <template>
   <main class="app-shell">
-    <div class="topbar">
-      <h1>
-        <button class="header-brand-btn" @click="openAboutModal" title="About Purze BCH Wallet">
-          <FontAwesomeIcon :icon="['fas', 'cube']" class="icon-head" />Purze BCH Wallet
+    <div class="topbar-simple">
+      <div class="top-wallet-group" role="group" aria-label="Wallet actions">
+        <button class="top-receive-btn" @click="openReceiveModal" title="Receive BCH" aria-label="Receive BCH">
+          <FontAwesomeIcon :icon="['fas', 'wallet']" class="top-connect-icon" />
         </button>
-      </h1>
+        <button class="top-wallet-btn" @click="openWalletListModal" title="Select Wallet" aria-label="Select Wallet">
+          <span class="top-wallet-text">
+            <span class="top-wallet-caption">Select Wallet</span>
+            <span class="top-wallet-current">{{ currentWalletButtonLabel }}</span>
+          </span>
+        </button>
+      </div>
+      <div class="top-quick-actions">
+        <button class="top-connect-btn top-refresh-btn" @click="refreshBalancesAndTokens" title="Refresh balances" aria-label="Refresh balances">
+          <FontAwesomeIcon :icon="['fas', 'rotate']" class="top-connect-icon" />
+        </button>
+        <button
+          class="top-connect-btn"
+          :class="{ 'wc-connected': hasActiveWcSessions }"
+          @click="openWalletConnectModal"
+          :title="hasActiveWcSessions ? 'WalletConnect connected' : 'WalletConnect'"
+          :aria-label="hasActiveWcSessions ? 'WalletConnect connected' : 'WalletConnect'"
+        >
+          <FontAwesomeIcon :icon="['fas', 'link']" class="top-connect-icon" />
+          <span v-if="hasActiveWcSessions" class="wc-connected-dot" aria-hidden="true"></span>
+          <span v-if="pendingWcRequests.length > 0" class="wc-pending-badge">{{ pendingWcRequests.length }}</span>
+        </button>
+      </div>
     </div>
 
-    <div class="panel-grid">
-    <section class="panel panel-active">
-      <h2><FontAwesomeIcon :icon="['fas', 'wallet']" class="icon-title" />Active Wallet</h2>
+    <div class="home-stack">
+      <section class="glass-card active-wallet-card" :class="{ 'dropdown-open': showActiveDerivationEditor }">
+        <div v-if="activeWallet" class="meta">
+          <div class="address-grid">
+            <article class="address-card address-card-bch">
+              <div class="address-head">
+                <div class="address-title-wrap">
+                  <span class="address-icon-wrap"><FontAwesomeIcon :icon="['fas', 'wallet']" /></span>
+                  <div class="address-title-stack">
+                    <strong class="address-title">BCH Wallet Address</strong>
+                    <span class="address-subtitle">Primary send and receive</span>
+                  </div>
+                </div>
+                <div class="address-head-actions">
+                  <button class="tiny-btn inline-copy-btn address-copy-btn" @click="copyText(walletAddress, 'BCH address')" title="Copy BCH address" aria-label="Copy BCH address">
+                    <FontAwesomeIcon :icon="['fas', 'copy']" class="inline-copy-icon" />
+                  </button>
+                </div>
+              </div>
+              <div class="mono address-value" :title="walletAddress">{{ formatAddressSingleLine(walletAddress) }}</div>
+            </article>
 
-      <div class="row">
-        <label for="active-wallet-select">Wallet</label>
-        <UiSelect
-          id="active-wallet-select"
-          :model-value="activeWalletName"
-          :options="activeWalletOptions"
-          placeholder="Select wallet"
-          @update:modelValue="onActiveWalletChange"
-        />
-      </div>
+            <article class="address-card address-card-token">
+              <div class="address-head">
+                <div class="address-title-wrap">
+                  <span class="address-icon-wrap"><FontAwesomeIcon :icon="['fas', 'coins']" /></span>
+                  <div class="address-title-stack">
+                    <strong class="address-title">CashToken Wallet Address</strong>
+                    <span class="address-subtitle">Token receive address</span>
+                  </div>
+                </div>
+                <button class="tiny-btn inline-copy-btn address-copy-btn" @click="copyText(tokenWalletAddress, 'CashToken address')" title="Copy CashToken address" aria-label="Copy CashToken address">
+                  <FontAwesomeIcon :icon="['fas', 'copy']" class="inline-copy-icon" />
+                </button>
+              </div>
+              <div class="mono address-value" :title="tokenWalletAddress">{{ formatAddressSingleLine(tokenWalletAddress) }}</div>
+            </article>
+          </div>
 
-      <div class="meta" v-if="activeWallet">
-        <div>
-          <div class="meta-head-inline">
-            <strong>BCH wallet address:</strong>
-            <button class="tiny-btn inline-copy-btn" @click="copyText(walletAddress, 'BCH address')" title="Copy BCH address" aria-label="Copy BCH address">
-              <span class="inline-copy-icon" aria-hidden="true">⧉</span>
+          <div class="active-derivation-row">
+            <div><strong>Derivation:</strong> {{ activeDerivationPath }}</div>
+            <button class="tiny-btn active-derivation-btn" @click="toggleActiveWalletDerivationEditor" :disabled="!activeSeedPhrase">
+              <FontAwesomeIcon :icon="['fas', showActiveDerivationEditor ? 'xmark' : 'rotate']" class="icon-btn" />{{ showActiveDerivationEditor ? 'Close' : 'Change' }}
             </button>
           </div>
-          <div class="mono">{{ walletAddress }}</div>
-        </div>
-        <div>
-          <div class="meta-head-inline">
-            <strong>CashToken wallet address:</strong>
-            <button class="tiny-btn inline-copy-btn" @click="copyText(tokenWalletAddress, 'CashToken address')" title="Copy CashToken address" aria-label="Copy CashToken address">
-              <span class="inline-copy-icon" aria-hidden="true">⧉</span>
-            </button>
+          <div class="active-derivation-editor" v-if="showActiveDerivationEditor">
+            <div class="row">
+              <label for="active-derivation-select">New Derivation Path</label>
+              <UiSelect
+                id="active-derivation-select"
+                :model-value="derivationUpdateType"
+                :options="derivationOptions"
+                @update:modelValue="onDerivationUpdateTypeChangeAndApply"
+              />
+            </div>
+            <div class="row" v-if="derivationUpdateType === 'custom'">
+              <label for="active-custom-derivation-input">Custom Path</label>
+              <input
+                id="active-custom-derivation-input"
+                v-model="customDerivationPathUpdate"
+                placeholder="m/44'/145'/0' or m/44'/145'/0'/0/0"
+                @change="applyCustomDerivationIfValid"
+                @keydown.enter.prevent="applyCustomDerivationIfValid"
+              />
+            </div>
+            <p class="hint" v-if="derivationUpdateType === 'custom'">Press Enter after typing a custom path to apply and reload.</p>
+            <p class="hint" v-if="isUpdatingDerivation">Updating derivation and reloading wallet...</p>
           </div>
-          <div class="mono">{{ tokenWalletAddress }}</div>
         </div>
-        <div><strong>Derivation:</strong> {{ activeDerivationPath }}</div>
-        <div><strong>BCH balance:</strong> {{ bchBalance.toString() }} sats ({{ formatBchFromSats(bchBalance) }} BCH)</div>
-        <div><strong>USD equivalent:</strong> {{ formatUsd(usdBalance) }}</div>
-        <div class="active-wallet-actions">
-          <button @click="openReceiveModal"><FontAwesomeIcon :icon="['fas', 'wallet']" class="icon-btn" />Receive</button>
-          <button @click="refreshBalancesAndTokens"><FontAwesomeIcon :icon="['fas', 'rotate']" class="icon-btn" />Refresh balances/tokens</button>
-        </div>
+        <div v-else class="hint">Create or import a wallet to get started.</div>
+      </section>
 
-        <div class="send-box">
-          <button
-            v-if="isMobileView"
-            class="collapse-toggle sub-collapse"
-            @click="toggleSendCollapsed"
-            :aria-expanded="(!sendCollapsed).toString()"
-          >
-            <span><FontAwesomeIcon :icon="['fas', 'paper-plane']" class="icon-btn" />Send</span>
-            <FontAwesomeIcon :icon="sendCollapsed ? ['fas', 'plus'] : ['fas', 'xmark']" class="icon-btn" />
+      <section class="glass-card tokens-preview-card">
+        <div class="tokens-preview-head">
+          <h3><FontAwesomeIcon :icon="['fas', 'coins']" class="icon-title" />Tokens</h3>
+          <span class="tokens-preview-usd">{{ formatUsd(usdBalance) }}</span>
+          <button class="tiny-btn" @click="openTokenListModal" :disabled="assetItems.length === 0">View all</button>
+        </div>
+        <div v-if="assetItems.length === 0" class="hint">No assets found.</div>
+        <div class="token-cards" v-else>
+          <article class="token-card" v-for="asset in previewAssets" :key="`preview-${asset.key}`">
+            <button
+              v-if="asset.kind === 'token' && asset.category"
+              class="token-icon-slot token-icon-btn"
+              :class="{ copied: copiedTokenId === asset.category }"
+              @click="copyTokenId(asset.category)"
+              :aria-label="`Copy token id for ${asset.displayName}`"
+              :title="`Copy token id: ${asset.displayName}`"
+            >
+              <img
+                v-if="isAssetIconVisible(asset)"
+                class="token-icon-image"
+                :src="asset.iconUri"
+                :alt="`${asset.displayName} icon`"
+                loading="lazy"
+                decoding="async"
+                referrerpolicy="no-referrer"
+                @error="onAssetIconError(asset.key, asset.iconUri)"
+              />
+              <FontAwesomeIcon v-else :icon="['fas', 'coins']" />
+            </button>
+            <div v-else class="token-icon-slot" aria-hidden="true">
+              <img
+                v-if="isAssetIconVisible(asset)"
+                class="token-icon-image"
+                :src="asset.iconUri"
+                :alt="`${asset.displayName} icon`"
+                loading="lazy"
+                decoding="async"
+                referrerpolicy="no-referrer"
+                @error="onAssetIconError(asset.key, asset.iconUri)"
+              />
+              <FontAwesomeIcon v-else :icon="['fas', 'coins']" />
+            </div>
+            <div class="token-info-grid">
+              <div class="token-main-line">
+                <div class="token-card-title">
+                  <span v-if="asset.kind === 'token' && asset.category && isTokenCategoryFavorite(asset.category)" class="token-favorite-badge" title="Favorite token" aria-label="Favorite token">
+                    <FontAwesomeIcon :icon="['fas', 'star']" />
+                  </span>
+                  {{ asset.displayName }}<span v-if="asset.symbol"> ({{ asset.symbol }})</span>
+                </div>
+                <strong class="token-usd-value">{{ asset.usdValueText }}</strong>
+              </div>
+              <div class="token-sub-line">
+                <span class="token-price-source">{{ asset.cauldronPriceText }}</span>
+                <span class="token-amount-main">{{ asset.amountText }}</span>
+              </div>
+            </div>
+            <div class="token-actions-line">
+              <button
+                class="tiny-btn token-send-btn"
+                @click="openSendAssetModal(asset)"
+                :disabled="!asset.canSend"
+                :aria-label="`Send ${asset.displayName}`"
+                :title="`Send ${asset.displayName}`"
+              >
+                <FontAwesomeIcon :icon="['fas', 'paper-plane']" class="icon-btn" />
+              </button>
+            </div>
+          </article>
+        </div>
+      </section>
+    </div>
+
+    <div v-if="activeOverlayScreen === 'wallet-list'" class="action-sheet-overlay" @click.self="closeWalletListModal">
+      <dialog class="action-sheet wallet-list-modal" open aria-label="Wallet list">
+        <div class="action-sheet-header">
+          <div class="action-sheet-title-wrap">
+            <strong class="action-sheet-title">Wallets</strong>
+            <span class="action-sheet-subtitle">Select active wallet or manage one</span>
+          </div>
+          <button class="icon-close" @click="closeWalletListModal" aria-label="Close wallet list">
+            <FontAwesomeIcon :icon="['fas', 'xmark']" />
           </button>
-          <h3 v-else><FontAwesomeIcon :icon="['fas', 'paper-plane']" class="icon-title" />Send</h3>
+        </div>
 
-          <div v-if="!isMobileView || !sendCollapsed" class="send-box-body">
-          <div class="row">
-            <label for="send-asset-select">Asset</label>
-            <UiSelect
-              id="send-asset-select"
-              :model-value="sendMode"
-              :options="sendModeOptions"
-              @update:modelValue="onSendModeChange"
-            />
+        <div class="manage-wallet-info wallet-list-panel">
+          <div v-if="wallets.length === 0" class="hint">No wallets yet.</div>
+          <ul v-else class="wallet-list">
+            <li
+              v-for="wallet in wallets"
+              :key="`modal-${wallet.name}`"
+              class="wallet-item"
+              @click="onActiveWalletChange(wallet.name)"
+            >
+              <div class="wallet-item-main">
+                <div>
+                  <strong>{{ wallet.name }}</strong>
+                  <span v-if="wallet.name === activeWalletName" class="wallet-tag active">active</span>
+                </div>
+                <div class="wallet-item-actions">
+                  <button class="tiny-btn wallet-row-btn" @click.stop="closeWalletListModal(); openWalletActionSheet(wallet.name)" title="Manage wallet" aria-label="Manage wallet">
+                    <FontAwesomeIcon :icon="['fas', 'bars']" class="icon-btn" />
+                  </button>
+                </div>
+              </div>
+            </li>
+          </ul>
+        </div>
+
+        <button class="action-sheet-btn" @click="closeWalletListModal(); openCreateImportModal()">
+          <FontAwesomeIcon :icon="['fas', 'plus']" class="icon-btn" />Add / Import Wallet
+        </button>
+      </dialog>
+    </div>
+
+    <div v-if="activeOverlayScreen === 'token-list'" class="action-sheet-overlay" @click.self="closeTokenListModal">
+      <dialog class="action-sheet token-list-modal" open aria-label="All tokens">
+        <div class="action-sheet-header">
+          <div class="action-sheet-title-wrap">
+            <strong class="action-sheet-title">All Tokens</strong>
+            <span class="action-sheet-subtitle">Complete token list</span>
+          </div>
+          <button class="icon-close" @click="closeTokenListModal" aria-label="Close token list">
+            <FontAwesomeIcon :icon="['fas', 'xmark']" />
+          </button>
+        </div>
+
+        <div class="manage-wallet-info">
+          <div v-if="assetItems.length === 0" class="hint">No assets found.</div>
+          <div class="token-cards" v-else>
+            <article class="token-card" v-for="asset in assetItems" :key="`all-${asset.key}`">
+              <button
+                v-if="asset.kind === 'token' && asset.category"
+                class="token-icon-slot token-icon-btn"
+                :class="{ copied: copiedTokenId === asset.category }"
+                @click="copyTokenId(asset.category)"
+                :aria-label="`Copy token id for ${asset.displayName}`"
+                :title="`Copy token id: ${asset.displayName}`"
+              >
+                <img
+                  v-if="isAssetIconVisible(asset)"
+                  class="token-icon-image"
+                  :src="asset.iconUri"
+                  :alt="`${asset.displayName} icon`"
+                  loading="lazy"
+                  decoding="async"
+                  referrerpolicy="no-referrer"
+                  @error="onAssetIconError(asset.key, asset.iconUri)"
+                />
+                <FontAwesomeIcon v-else :icon="['fas', 'coins']" />
+              </button>
+              <div v-else class="token-icon-slot" aria-hidden="true">
+                <img
+                  v-if="isAssetIconVisible(asset)"
+                  class="token-icon-image"
+                  :src="asset.iconUri"
+                  :alt="`${asset.displayName} icon`"
+                  loading="lazy"
+                  decoding="async"
+                  referrerpolicy="no-referrer"
+                  @error="onAssetIconError(asset.key, asset.iconUri)"
+                />
+                <FontAwesomeIcon v-else :icon="['fas', 'coins']" />
+              </div>
+              <div class="token-info-grid">
+                <div class="token-main-line">
+                  <div class="token-card-title">
+                    <span v-if="asset.kind === 'token' && asset.category && isTokenCategoryFavorite(asset.category)" class="token-favorite-badge" title="Favorite token" aria-label="Favorite token">
+                      <FontAwesomeIcon :icon="['fas', 'star']" />
+                    </span>
+                    {{ asset.displayName }}<span v-if="asset.symbol"> ({{ asset.symbol }})</span>
+                  </div>
+                  <strong class="token-usd-value">{{ asset.usdValueText }}</strong>
+                </div>
+                <div class="token-sub-line">
+                  <span class="token-price-source">{{ asset.cauldronPriceText }}</span>
+                  <span class="token-amount-main">{{ asset.amountText }}</span>
+                </div>
+              </div>
+              <div class="token-actions-line">
+                <button
+                  v-if="asset.kind === 'token' && asset.category"
+                  class="tiny-btn token-favorite-btn"
+                  :class="{ active: isTokenCategoryFavorite(asset.category) }"
+                  @click="toggleFavoriteToken(asset.category)"
+                  :aria-label="isTokenCategoryFavorite(asset.category) ? `Remove ${asset.displayName} from favorites` : `Add ${asset.displayName} to favorites`"
+                  :title="isTokenCategoryFavorite(asset.category) ? 'Remove from favorites' : 'Add to favorites'"
+                >
+                  <FontAwesomeIcon :icon="['fas', 'star']" class="icon-btn" />
+                </button>
+                <button
+                  v-if="asset.kind === 'token' && asset.category"
+                  class="tiny-btn token-hide-btn"
+                  @click="hideToken(asset.category)"
+                  :aria-label="`Hide ${asset.displayName}`"
+                  :title="`Hide ${asset.displayName}`"
+                >
+                  <FontAwesomeIcon :icon="['fas', 'eye-slash']" class="icon-btn" />
+                </button>
+                <button
+                  class="tiny-btn token-send-btn"
+                  @click="openSendAssetModal(asset)"
+                  :disabled="!asset.canSend"
+                  :aria-label="`Send ${asset.displayName}`"
+                  :title="`Send ${asset.displayName}`"
+                >
+                  <FontAwesomeIcon :icon="['fas', 'paper-plane']" class="icon-btn" />
+                </button>
+              </div>
+            </article>
           </div>
 
-          <div class="row" v-if="sendMode === 'token'">
-            <label for="send-token-select">Token</label>
-            <UiSelect
-              id="send-token-select"
-              :model-value="sendTokenCategory"
-              :options="sendTokenOptions"
-              placeholder="Select token"
-              @update:modelValue="onSendTokenCategoryChange"
-            />
+          <div v-if="hiddenTokenCount > 0" class="hidden-token-panel">
+            <div class="hidden-token-panel-head">
+              <strong><FontAwesomeIcon :icon="['fas', 'eye-slash']" class="icon-btn" />Hidden tokens ({{ hiddenTokenCount }})</strong>
+              <button class="tiny-btn" @click="toggleShowHiddenTokensInModal">
+                <FontAwesomeIcon :icon="['fas', showHiddenTokensInModal ? 'xmark' : 'bars']" class="icon-btn" />
+                {{ showHiddenTokensInModal ? 'Hide list' : 'Show list' }}
+              </button>
+            </div>
+            <div class="token-cards" v-if="showHiddenTokensInModal">
+              <article class="token-card" v-for="asset in hiddenAssetItems" :key="`hidden-${asset.key}`">
+                <button
+                  v-if="asset.kind === 'token' && asset.category"
+                  class="token-icon-slot token-icon-btn"
+                  :class="{ copied: copiedTokenId === asset.category }"
+                  @click="copyTokenId(asset.category)"
+                  :aria-label="`Copy token id for ${asset.displayName}`"
+                  :title="`Copy token id: ${asset.displayName}`"
+                >
+                  <img
+                    v-if="isAssetIconVisible(asset)"
+                    class="token-icon-image"
+                    :src="asset.iconUri"
+                    :alt="`${asset.displayName} icon`"
+                    loading="lazy"
+                    decoding="async"
+                    referrerpolicy="no-referrer"
+                    @error="onAssetIconError(asset.key, asset.iconUri)"
+                  />
+                  <FontAwesomeIcon v-else :icon="['fas', 'coins']" />
+                </button>
+                <div v-else class="token-icon-slot" aria-hidden="true">
+                  <img
+                    v-if="isAssetIconVisible(asset)"
+                    class="token-icon-image"
+                    :src="asset.iconUri"
+                    :alt="`${asset.displayName} icon`"
+                    loading="lazy"
+                    decoding="async"
+                    referrerpolicy="no-referrer"
+                    @error="onAssetIconError(asset.key, asset.iconUri)"
+                  />
+                  <FontAwesomeIcon v-else :icon="['fas', 'coins']" />
+                </div>
+                <div class="token-info-grid">
+                  <div class="token-main-line">
+                    <div class="token-card-title">
+                      <span v-if="asset.kind === 'token' && asset.category && isTokenCategoryFavorite(asset.category)" class="token-favorite-badge" title="Favorite token" aria-label="Favorite token">
+                        <FontAwesomeIcon :icon="['fas', 'star']" />
+                      </span>
+                      {{ asset.displayName }}<span v-if="asset.symbol"> ({{ asset.symbol }})</span>
+                    </div>
+                    <strong class="token-usd-value">{{ asset.usdValueText }}</strong>
+                  </div>
+                  <div class="token-sub-line">
+                    <span class="token-price-source">{{ asset.cauldronPriceText }}</span>
+                    <span class="token-amount-main">{{ asset.amountText }}</span>
+                  </div>
+                </div>
+                <div class="token-actions-line">
+                  <button
+                    v-if="asset.kind === 'token' && asset.category"
+                    class="tiny-btn token-favorite-btn"
+                    :class="{ active: isTokenCategoryFavorite(asset.category) }"
+                    @click="toggleFavoriteToken(asset.category)"
+                    :aria-label="isTokenCategoryFavorite(asset.category) ? `Remove ${asset.displayName} from favorites` : `Add ${asset.displayName} to favorites`"
+                    :title="isTokenCategoryFavorite(asset.category) ? 'Remove from favorites' : 'Add to favorites'"
+                  >
+                    <FontAwesomeIcon :icon="['fas', 'star']" class="icon-btn" />
+                  </button>
+                  <button
+                    v-if="asset.kind === 'token' && asset.category"
+                    class="tiny-btn token-unhide-btn"
+                    @click="unhideToken(asset.category)"
+                    :aria-label="`Show ${asset.displayName} again`"
+                    :title="`Show ${asset.displayName} again`"
+                  >
+                    <FontAwesomeIcon :icon="['fas', 'eye']" class="icon-btn" />
+                  </button>
+                </div>
+              </article>
+            </div>
           </div>
+        </div>
+      </dialog>
+    </div>
 
+    <div v-if="activeOverlayScreen === 'send-asset'" class="action-sheet-overlay" @click.self="closeSendAssetModal">
+      <dialog class="action-sheet send-asset-modal" :class="{ 'send-asset-modal-token': sendMode === 'token' || sendMode === 'bch' }" open aria-label="Send asset">
+        <div class="action-sheet-header">
+          <div class="action-sheet-title-wrap">
+            <strong class="action-sheet-title">Send {{ activeSendAssetLabel }}</strong>
+            <span class="action-sheet-subtitle">Transfer from current wallet</span>
+          </div>
+          <button class="icon-close" @click="closeSendAssetModal" aria-label="Close send screen">
+            <FontAwesomeIcon :icon="['fas', 'xmark']" />
+          </button>
+        </div>
+
+        <div class="manage-wallet-info">
           <div class="row">
-            <label for="send-to-address-input">{{ sendMode === 'token' ? 'To Token Address' : 'To BCH Address' }}</label>
+            <label for="send-modal-to-address-input">{{ sendMode === 'token' ? 'To Token Address' : 'To BCH Address' }}</label>
             <input
-              id="send-to-address-input"
+              id="send-modal-to-address-input"
               v-model="sendToAddress"
               :placeholder="sendMode === 'token' ? 'bitcoincash:... token address' : 'bitcoincash:... BCH address'"
             />
           </div>
 
           <div class="row" v-if="sendMode === 'bch'">
-            <label for="send-bch-amount-input">Amount (BCH)</label>
-            <input id="send-bch-amount-input" v-model="sendBchAmount" placeholder="0.00001" />
+            <label for="send-modal-bch-amount-input">Amount (BCH)</label>
+            <input id="send-modal-bch-amount-input" v-model="sendBchAmount" placeholder="0.00001" />
           </div>
 
           <div class="row" v-else>
-            <label for="send-token-amount-input">Amount{{ selectedSendToken ? ` (${selectedSendToken.decimals} decimals)` : '' }}</label>
-            <input id="send-token-amount-input" v-model="sendTokenAmount" :placeholder="selectedSendToken?.decimals ? '1.0' : '1'" />
+            <label for="send-modal-token-amount-input">Amount{{ selectedSendToken ? ` (${selectedSendToken.decimals} decimals)` : '' }}</label>
+            <input id="send-modal-token-amount-input" v-model="sendTokenAmount" :placeholder="selectedSendToken?.decimals ? '1.0' : '1'" />
           </div>
 
           <button @click="sendFunds" :disabled="isSendingFunds || (sendMode === 'token' && sendableTokens.length === 0)">
             <FontAwesomeIcon :icon="['fas', isSendingFunds ? 'rotate' : 'paper-plane']" class="icon-btn" />
             {{ isSendingFunds ? 'Sending...' : (sendMode === 'token' ? 'Send CashToken' : 'Send BCH') }}
           </button>
+
           <p class="hint" v-if="sendMode === 'token' && selectedSendToken">
             Available: {{ formatTokenAmount(selectedSendToken.fungibleAmount, selectedSendToken.decimals) }}{{ selectedSendToken.symbol ? ` ${selectedSendToken.symbol}` : '' }}
           </p>
-          <p class="hint" v-if="sendMode === 'token' && sendableTokens.length === 0">No fungible CashToken balance available to send.</p>
-          </div>
+
         </div>
-      </div>
-      <div v-else>
-        Create or import a wallet to see details.
-      </div>
-    </section>
 
-    <section class="panel panel-tokens">
-      <button
-        v-if="isMobileView"
-        class="collapse-toggle"
-        @click="toggleTokenListCollapsed"
-        :aria-expanded="(!tokenListCollapsed).toString()"
-      >
-        <span><FontAwesomeIcon :icon="['fas', 'coins']" class="icon-btn" />Tokens</span>
-        <FontAwesomeIcon :icon="tokenListCollapsed ? ['fas', 'plus'] : ['fas', 'xmark']" class="icon-btn" />
-      </button>
-      <h2 v-else><FontAwesomeIcon :icon="['fas', 'coins']" class="icon-title" />Tokens</h2>
-
-      <div v-if="!isMobileView || !tokenListCollapsed" class="section-body">
-      <div v-if="tokenList.length === 0">No tokens found.</div>
-      <div class="token-cards" v-else>
-        <article class="token-card" v-for="token in tokenList" :key="`card-${token.category}`">
-          <div class="token-main-line">
-            <div class="token-card-title">{{ token.displayName }}<span v-if="token.symbol"> ({{ token.symbol }})</span></div>
-            <div class="token-quick-stats">
-              <strong>{{ formatTokenAmount(token.fungibleAmount, token.decimals) }}</strong>
-              <span class="token-nft-mini">NFT {{ token.nftCount }}</span>
+        <div class="manage-wallet-info send-history-card" v-if="sendMode === 'token' || sendMode === 'bch'">
+            <div class="send-history-head">
+              <strong><FontAwesomeIcon :icon="['fas', 'rotate']" class="icon-btn" />Recent {{ sendMode === 'token' ? 'Token' : 'BCH' }} Transactions</strong>
+              <button class="tiny-btn" @click="loadTokenSendHistory" :disabled="isLoadingTokenSendHistory" aria-label="Refresh transaction history" title="Refresh transaction history">
+                <FontAwesomeIcon :icon="['fas', 'rotate']" class="icon-btn" />
+              </button>
+            </div>
+            <div class="send-history-body">
+              <p class="hint" v-if="isLoadingTokenSendHistory">Loading transaction history...</p>
+              <p class="hint" v-else-if="tokenSendHistoryError">{{ tokenSendHistoryError }}</p>
+              <p class="hint" v-else-if="sendMode === 'token' && selectedTokenSendHistory.length === 0">No recent transactions for this token yet.</p>
+              <p class="hint" v-else-if="sendMode === 'bch' && selectedBchSendHistory.length === 0">No recent BCH transactions yet.</p>
+              <ul v-else-if="sendMode === 'token'" class="send-history-list">
+              <li
+                v-for="entry in selectedTokenSendHistory"
+                :key="`send-history-${entry.hash}`"
+                class="send-history-item"
+              >
+                <div class="send-history-item-top">
+                  <span class="send-history-direction" :class="entry.direction">{{ entry.direction === 'sent' ? 'Sent' : 'Received' }}</span>
+                  <div class="send-history-top-right">
+                    <strong>
+                      {{ formatTokenAmount(entry.amount < 0n ? -entry.amount : entry.amount, selectedSendToken?.decimals ?? 0) }}
+                      <span v-if="selectedSendToken?.symbol"> {{ selectedSendToken.symbol }}</span>
+                    </strong>
+                    <button
+                      class="tiny-btn send-history-open-btn"
+                      @click.stop="openTokenHistoryTransaction(entry.hash)"
+                      :aria-label="`Open transaction ${entry.hash} in block explorer`"
+                      :title="`Open transaction ${entry.hash} in block explorer`"
+                    >
+                      <FontAwesomeIcon :icon="['fas', 'link']" />
+                    </button>
+                  </div>
+                </div>
+                <div class="send-history-item-meta">
+                  <span class="mono" :title="entry.hash">{{ formatHistoryTxHash(entry.hash) }}</span>
+                  <span>{{ formatHistoryTimestamp(entry.timestamp, entry.blockHeight) }}</span>
+                </div>
+              </li>
+              </ul>
+              <ul v-else class="send-history-list">
+                <li
+                  v-for="entry in selectedBchSendHistory"
+                  :key="`send-history-bch-${entry.hash}`"
+                  class="send-history-item"
+                >
+                  <div class="send-history-item-top">
+                    <span class="send-history-direction" :class="entry.direction">{{ entry.direction === 'sent' ? 'Sent' : 'Received' }}</span>
+                    <div class="send-history-top-right">
+                      <strong>{{ formatBchFromSats(entry.amountSats) }} BCH</strong>
+                      <button
+                        class="tiny-btn send-history-open-btn"
+                        @click.stop="openTokenHistoryTransaction(entry.hash)"
+                        :aria-label="`Open transaction ${entry.hash} in block explorer`"
+                        :title="`Open transaction ${entry.hash} in block explorer`"
+                      >
+                        <FontAwesomeIcon :icon="['fas', 'link']" />
+                      </button>
+                    </div>
+                  </div>
+                  <div class="send-history-item-meta">
+                    <span class="mono" :title="entry.hash">{{ formatHistoryTxHash(entry.hash) }}</span>
+                    <span>{{ formatHistoryTimestamp(entry.timestamp, entry.blockHeight) }}</span>
+                  </div>
+                </li>
+              </ul>
             </div>
           </div>
-          <button class="token-id-btn" :class="{ copied: copiedTokenId === token.category }" @click="copyTokenId(token.category)" :title="token.category">
-            <span class="token-id mono">{{ truncateTokenId(token.category) }}</span>
-            <span class="token-id-copy">{{ copiedTokenId === token.category ? 'Copied' : 'Copy' }}</span>
-            <span class="copy-check" :class="{ show: copiedTokenId === token.category }" aria-hidden="true"></span>
-          </button>
-        </article>
-      </div>
-      <div class="table-wrap desktop-table" v-if="tokenList.length > 0">
-      <table>
-        <thead>
-          <tr>
-            <th>Name</th>
-            <th>Category</th>
-            <th>Fungible Amount</th>
-            <th>NFT Count</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr v-for="token in tokenList" :key="token.category">
-            <td>{{ token.displayName }}<span v-if="token.symbol"> ({{ token.symbol }})</span></td>
-            <td>
-              <button class="token-id-btn" :class="{ copied: copiedTokenId === token.category }" @click="copyTokenId(token.category)" :title="token.category">
-                <span class="token-id mono">{{ truncateTokenId(token.category) }}</span>
-                <span class="token-id-copy">{{ copiedTokenId === token.category ? 'Copied' : 'Copy' }}</span>
-                <span class="copy-check" :class="{ show: copiedTokenId === token.category }" aria-hidden="true"></span>
-              </button>
-            </td>
-            <td>{{ formatTokenAmount(token.fungibleAmount, token.decimals) }}</td>
-            <td>{{ token.nftCount }}</td>
-          </tr>
-        </tbody>
-      </table>
-      </div>
-      </div>
-    </section>
+      </dialog>
+    </div>
 
-    <section ref="walletManagerSectionEl" class="panel panel-wallet">
-      <button class="collapse-toggle" @click="walletManagerCollapsed = !walletManagerCollapsed">
-        <span><FontAwesomeIcon :icon="['fas', 'wallet']" class="icon-btn" />Wallet Manager</span>
-        <FontAwesomeIcon :icon="walletManagerCollapsed ? ['fas', 'plus'] : ['fas', 'xmark']" class="icon-btn" />
-      </button>
-      <div v-if="!walletManagerCollapsed" class="manager-body">
-      <div class="manager-subpanel">
-        <h3>Wallets</h3>
-        <div v-if="wallets.length === 0" class="hint">No wallets yet.</div>
-        <ul v-else class="wallet-list">
-          <li v-for="wallet in wallets" :key="wallet.name" class="wallet-item">
-            <div class="wallet-item-main">
-              <div :title="`Type: ${wallet.type}${wallet.source ? `, Source: ${wallet.source}` : ''}`">
-                <strong>{{ wallet.name }}</strong>
-                <span v-if="wallet.name === activeWalletName" class="wallet-tag active">active</span>
-              </div>
-              <div class="wallet-item-actions">
-                <button class="tiny-btn wallet-row-btn" @click="onActiveWalletChange(wallet.name)">Use</button>
-                <button class="tiny-btn wallet-row-btn" @click="openWalletActionSheet(wallet.name)">
-                  <FontAwesomeIcon :icon="['fas', 'sliders']" class="icon-btn" />Manage
+    <div v-if="activeOverlayScreen === 'wallet-connect'" class="action-sheet-overlay" @click.self="closeWalletConnectModal">
+      <dialog class="action-sheet wallet-connect-modal" open aria-label="WalletConnect">
+        <div class="action-sheet-header">
+          <div class="action-sheet-title-wrap">
+            <strong class="action-sheet-title wc-modal-title"><FontAwesomeIcon :icon="['fas', 'link']" class="wc-title-icon" />WalletConnect</strong>
+            <span class="action-sheet-subtitle">Securely connect to dApps and manage sessions</span>
+          </div>
+          <button class="icon-close" @click="closeWalletConnectModal" aria-label="Close WalletConnect screen">
+            <FontAwesomeIcon :icon="['fas', 'xmark']" />
+          </button>
+        </div>
+
+        <div class="manage-wallet-info wc-overview-card">
+          <div class="wc-overview-grid">
+            <div class="wc-overview-item" :class="hasActiveWcSessions ? 'active' : ''">
+              <span class="manage-label">Connection</span>
+              <strong>
+                <FontAwesomeIcon :icon="['fas', hasActiveWcSessions ? 'plug' : 'link']" class="wc-overview-icon" />
+                {{ hasActiveWcSessions ? 'Connected' : 'Not connected' }}
+              </strong>
+            </div>
+            <div class="wc-overview-item">
+              <span class="manage-label">Sessions</span>
+              <strong><FontAwesomeIcon :icon="['fas', 'wallet']" class="wc-overview-icon" />{{ wcSessionCount }}</strong>
+            </div>
+            <div class="wc-overview-item" :class="pendingWcRequests.length > 0 ? 'pending' : ''">
+              <span class="manage-label">Pending</span>
+              <strong><FontAwesomeIcon :icon="['fas', 'triangle-exclamation']" class="wc-overview-icon" />{{ pendingWcRequests.length }}</strong>
+            </div>
+          </div>
+          <p class="hint wc-overview-hint">Active wallet: <strong>{{ activeWalletName || 'No wallet selected' }}</strong></p>
+        </div>
+
+        <div class="manage-wallet-info wc-connection-proposal-card" v-if="pendingWcConnectionProposal">
+          <div class="wc-section-head">
+            <div class="wc-section-title-wrap">
+              <strong class="wc-section-title"><FontAwesomeIcon :icon="['fas', 'triangle-exclamation']" class="wc-section-icon" />Connection Request</strong>
+              <span class="hint">Review this webapp before connecting your wallet</span>
+            </div>
+          </div>
+          <div class="wc-proposal-dapp">
+            <div class="wc-dapp-avatar" aria-hidden="true">
+              <img v-if="pendingWcConnectionProposal.appIcon" :src="pendingWcConnectionProposal.appIcon" :alt="`${pendingWcConnectionProposal.appName} icon`" loading="lazy" decoding="async" referrerpolicy="no-referrer" />
+              <span v-else>{{ (pendingWcConnectionProposal.appName || '?').charAt(0).toUpperCase() }}</span>
+            </div>
+            <div class="wc-dapp-meta">
+              <strong>{{ pendingWcConnectionProposal.appName }}</strong>
+              <span class="hint">{{ getDisplayHost(pendingWcConnectionProposal.appUrl) }}</span>
+            </div>
+          </div>
+          <div class="manage-field">
+            <span class="manage-label">Website</span>
+            <span>{{ pendingWcConnectionProposal.appUrl || 'Unknown origin' }}</span>
+          </div>
+          <div class="active-wallet-actions wc-approval-actions">
+            <button @click="approvePendingWcConnectionProposal" :disabled="isHandlingWcConnectionProposal">
+              <FontAwesomeIcon :icon="['fas', 'plug']" class="icon-btn" />
+              {{ isHandlingWcConnectionProposal ? 'Approving...' : 'Approve Connection' }}
+            </button>
+            <button class="delete-wallet-btn" @click="rejectPendingWcConnectionProposal" :disabled="isHandlingWcConnectionProposal">
+              <FontAwesomeIcon :icon="['fas', 'xmark']" class="icon-btn" />
+              {{ isHandlingWcConnectionProposal ? 'Rejecting...' : 'Reject Connection' }}
+            </button>
+          </div>
+        </div>
+
+        <div class="manage-wallet-info wc-pending-card" v-if="pendingWcApproval">
+          <div class="wc-section-head">
+            <div class="wc-section-title-wrap">
+              <strong class="wc-section-title"><FontAwesomeIcon :icon="['fas', 'triangle-exclamation']" class="wc-section-icon" />Pending Approval</strong>
+              <span class="hint">Review before the dApp can proceed</span>
+            </div>
+          </div>
+          <div class="manage-field">
+            <span class="manage-label">dApp</span>
+            <span>{{ pendingWcApproval.peerName }}</span>
+          </div>
+          <div class="manage-field">
+            <span class="manage-label">Requested Method</span>
+            <span class="wc-method-pill">{{ pendingWcApproval.method }}</span>
+          </div>
+          <div class="manage-field">
+            <span class="manage-label">Session Topic</span>
+            <span class="mono">{{ pendingWcApproval.topic }}</span>
+          </div>
+          <div class="active-wallet-actions wc-approval-actions">
+            <button @click="approvePendingWcRequest" :disabled="isHandlingWcApproval">
+              <FontAwesomeIcon :icon="['fas', 'plug']" class="icon-btn" />
+              {{ isHandlingWcApproval ? 'Approving...' : 'Approve Request' }}
+            </button>
+            <button class="delete-wallet-btn" @click="rejectPendingWcRequest" :disabled="isHandlingWcApproval">
+              <FontAwesomeIcon :icon="['fas', 'xmark']" class="icon-btn" />
+              {{ isHandlingWcApproval ? 'Rejecting...' : 'Reject Request' }}
+            </button>
+          </div>
+        </div>
+
+        <div class="manage-wallet-info" v-else>
+          <div class="hint"><FontAwesomeIcon :icon="['fas', 'circle-info']" class="wc-inline-icon" />No pending approvals right now.</div>
+        </div>
+
+        <div class="manage-wallet-info wc-connect-card">
+          <div class="wc-section-head">
+            <div class="wc-section-title-wrap">
+              <strong class="wc-section-title"><FontAwesomeIcon :icon="['fas', 'plug']" class="wc-section-icon" />Connect to a dApp</strong>
+              <span class="hint">{{ wcSessionCount === 0 ? 'Paste a WalletConnect URI from the webapp' : 'Connected webapp details' }}</span>
+            </div>
+          </div>
+          <div v-if="wcSessionCount === 0 && !hasPendingWcConnectionProposal">
+            <div class="row wc-uri-row">
+              <label for="wc-uri-input" class="wc-uri-label"><FontAwesomeIcon :icon="['fas', 'copy']" class="wc-inline-icon" />Paste WalletConnect URI Here</label>
+              <input id="wc-uri-input" class="wc-uri-input" v-model="wcUri" placeholder="wc:..." />
+            </div>
+            <p class="hint wc-uri-hint">Tip: Copy the full URI from the webapp and paste it into the highlighted field above.</p>
+            <button @click="pairWalletConnect" :disabled="!activeWallet || !wcUri.trim()"><FontAwesomeIcon :icon="['fas', 'plug']" class="icon-btn" />Pair and Connect</button>
+            <p class="hint" v-if="!activeWallet">Select a wallet first before pairing.</p>
+          </div>
+          <div v-else-if="hasPendingWcConnectionProposal" class="wc-connected-summary">
+            <p class="hint">A connection request is waiting above. Approve or reject it to continue.</p>
+          </div>
+          <div v-else class="wc-connected-summary">
+            <div class="manage-field">
+              <span class="manage-label">Connected dApp</span>
+              <span>{{ wcSessionEntries[0]?.[1]?.peerName || 'Unknown dApp' }}</span>
+            </div>
+            <div class="manage-field">
+              <span class="manage-label">Website</span>
+              <span>{{ getDisplayHost(wcSessionEntries[0]?.[1]?.peerUrl || '') }}</span>
+            </div>
+            <div class="manage-field">
+              <span class="manage-label">Accounts</span>
+              <span>{{ wcSessionEntries[0]?.[1]?.accounts.length || 0 }}</span>
+            </div>
+            <p class="hint" v-if="wcSessionCount > 1">{{ wcSessionCount }} dApps are connected. Full session details are listed below.</p>
+          </div>
+        </div>
+
+        <div class="manage-wallet-info wc-sessions-card">
+          <div class="wc-section-head">
+            <div class="wc-section-title-wrap">
+              <strong class="wc-section-title"><FontAwesomeIcon :icon="['fas', 'link']" class="wc-section-icon" />Active Sessions</strong>
+              <span class="hint">Tap disconnect to revoke access</span>
+            </div>
+            <span class="wallet-tag">{{ wcSessionCount }}</span>
+          </div>
+          <div v-if="wcSessionCount === 0" class="wc-empty-state">
+            <FontAwesomeIcon :icon="['fas', 'link']" class="wc-empty-icon" />
+            <div>
+              <strong>No active sessions</strong>
+              <p class="hint">After pairing, connected dApps will appear here.</p>
+            </div>
+          </div>
+          <ul v-else class="wc-session-list">
+            <li v-for="session in wcSessionEntries" :key="`wc-${session[0]}`" class="wc-session-item">
+              <div class="wc-session-head">
+                <div class="wc-dapp-avatar" aria-hidden="true">
+                  <img v-if="session[1].peerIcon" :src="session[1].peerIcon" :alt="`${session[1].peerName} icon`" loading="lazy" decoding="async" referrerpolicy="no-referrer" />
+                  <span v-else>{{ (session[1].peerName || '?').charAt(0).toUpperCase() }}</span>
+                </div>
+                <div class="wc-dapp-meta">
+                  <strong>{{ session[1].peerName }}</strong>
+                  <span class="hint">{{ getDisplayHost(session[1].peerUrl) }}</span>
+                </div>
+                <button class="tiny-btn wc-disconnect-btn" @click="disconnectSession(session[0])" title="Disconnect session" aria-label="Disconnect session">
+                  <FontAwesomeIcon :icon="['fas', 'xmark']" class="icon-btn" />Disconnect
                 </button>
               </div>
-            </div>
-          </li>
-        </ul>
-      </div>
-
-      <div class="manager-subpanel manager-create-import">
-        <h3>Create / Import Wallet</h3>
-        <p class="hint">Open the wallet setup modal to create a new wallet or import from seed phrase.</p>
-        <button @click="openCreateImportModal"><FontAwesomeIcon :icon="['fas', 'plus']" class="icon-btn" />Open Create / Import</button>
-      </div>
-
-      <div class="manager-subpanel" v-if="activeWallet && managerMode === 'backup'">
-        <h3>Backup</h3>
-        <p class="hint">Reveal and save this seed phrase securely offline.</p>
-        <button @click="showSeedPhrase = !showSeedPhrase">
-          <FontAwesomeIcon :icon="['fas', showSeedPhrase ? 'xmark' : 'plus']" class="icon-btn" />
-          {{ showSeedPhrase ? 'Hide Seed Phrase' : 'Show Seed Phrase' }}
-        </button>
-        <p v-if="showSeedPhrase && activeSeedPhrase" class="seed-phrase mono">{{ activeSeedPhrase }}</p>
-        <p v-if="showSeedPhrase && !activeSeedPhrase" class="hint">Seed phrase is not available for this wallet.</p>
-      </div>
-
-      <div class="manager-subpanel" v-if="activeWallet && managerMode === 'derivation'">
-        <h3>Derivation Path Reload</h3>
-        <p class="hint">If needed, switch derivation path and reload this wallet using its current seed phrase.</p>
-        <div class="row">
-          <label for="manager-derivation-select">New Derivation Path</label>
-          <UiSelect
-            id="manager-derivation-select"
-            :model-value="derivationUpdateType"
-            :options="derivationOptions"
-            @update:modelValue="onDerivationUpdateTypeChange"
-          />
+              <div class="wc-session-stats">
+                <span><FontAwesomeIcon :icon="['fas', 'wallet']" class="wc-stat-icon" />Accounts: {{ session[1].accounts.length }}</span>
+                <span class="mono"><FontAwesomeIcon :icon="['fas', 'link']" class="wc-stat-icon" />Topic: {{ session[0] }}</span>
+              </div>
+              <div class="mono wc-account-line" v-for="account in session[1].accounts" :key="account">{{ account }}</div>
+            </li>
+          </ul>
         </div>
-        <div class="row" v-if="derivationUpdateType === 'custom'">
-          <label for="manager-custom-derivation-input">Custom Path</label>
-          <input id="manager-custom-derivation-input" v-model="customDerivationPathUpdate" placeholder="m/44'/145'/0' or m/44'/145'/0'/0/0" />
-        </div>
-        <button @click="updateActiveWalletDerivationPath" :disabled="isUpdatingDerivation || !activeSeedPhrase">
-          <FontAwesomeIcon :icon="['fas', 'rotate']" class="icon-btn" />
-          {{ isUpdatingDerivation ? 'Updating...' : 'Update Derivation & Reload' }}
-        </button>
-      </div>
-      </div>
-    </section>
-
-    <section class="panel panel-wc">
-      <button
-        v-if="isMobileView"
-        class="collapse-toggle"
-        @click="toggleWalletConnectCollapsed"
-        :aria-expanded="(!walletConnectCollapsed).toString()"
-      >
-        <span><FontAwesomeIcon :icon="['fas', 'link']" class="icon-btn" />WalletConnect</span>
-        <FontAwesomeIcon :icon="walletConnectCollapsed ? ['fas', 'plus'] : ['fas', 'xmark']" class="icon-btn" />
-      </button>
-      <h2 v-else><FontAwesomeIcon :icon="['fas', 'link']" class="icon-title" />WalletConnect</h2>
-
-      <div v-if="!isMobileView || !walletConnectCollapsed" class="section-body">
-      <div class="row">
-        <label for="wc-uri-input">WC URI</label>
-        <input id="wc-uri-input" v-model="wcUri" placeholder="wc:..." />
-      </div>
-      <button @click="pairWalletConnect" :disabled="!activeWallet"><FontAwesomeIcon :icon="['fas', 'plug']" class="icon-btn" />Pair</button>
-
-      <p class="hint">WalletConnect initializes on first use to reduce startup data usage.</p>
-
-      <h3>Sessions</h3>
-      <div v-if="Object.keys(wcSessions).length === 0">No active sessions.</div>
-      <ul v-else>
-        <li v-for="session in Object.entries(wcSessions)" :key="session[0]">
-          <div><strong>{{ session[1].peerName }}</strong></div>
-          <div class="mono">{{ session[0] }}</div>
-          <div class="mono" v-for="account in session[1].accounts" :key="account">{{ account }}</div>
-          <button @click="disconnectSession(session[0])"><FontAwesomeIcon :icon="['fas', 'xmark']" class="icon-btn" />Disconnect</button>
-        </li>
-      </ul>
-      <p class="hint">
-        Note: this slim wallet auto-approves WalletConnect proposals and request signing for simplicity.
-      </p>
-      </div>
-    </section>
+      </dialog>
     </div>
 
     <div
-      v-if="actionSheetWalletName"
+      v-if="activeOverlayScreen === 'manage-wallet' && actionSheetWalletName"
       class="action-sheet-overlay"
       @click.self="closeWalletActionSheet"
     >
@@ -1467,14 +2705,14 @@ onBeforeUnmount(() => {
         </div>
 
         <div class="manage-view-tabs" v-if="actionSheetWalletName">
-          <button class="tab-btn" :class="{ active: manageModalMode === 'overview' }" @click="manageModalMode = 'overview'">Overview</button>
-          <button class="tab-btn" :class="{ active: manageModalMode === 'derivation' }" @click="openManageDerivation">Derivation</button>
-          <button class="tab-btn" :class="{ active: manageModalMode === 'backup' }" @click="openManageBackup">Backup</button>
+          <button class="tab-btn" :class="{ active: manageModalMode === 'overview' }" @click="manageModalMode = 'overview'"><FontAwesomeIcon :icon="['fas', 'address-card']" class="icon-btn" />Wallet Info</button>
+          <button class="tab-btn" :class="{ active: manageModalMode === 'derivation' }" @click="openManageDerivation"><FontAwesomeIcon :icon="['fas', 'route']" class="icon-btn" />Derivation</button>
+          <button class="tab-btn" :class="{ active: manageModalMode === 'backup' }" @click="openManageBackup"><FontAwesomeIcon :icon="['fas', 'key']" class="icon-btn" />Seed Backup</button>
         </div>
 
         <template v-if="manageModalMode === 'overview'">
         <div class="manage-wallet-info" v-if="manageWalletDetails">
-          <div class="hint" v-if="loadingManageWalletDetails">Loading wallet details...</div>
+          <div class="hint" v-if="loadingManageWalletDetails"><FontAwesomeIcon :icon="['fas', 'circle-info']" class="icon-btn" />Loading wallet details...</div>
           <template v-else>
             <div class="manage-wallet-badges">
               <span class="wallet-tag">{{ manageWalletDetails.type }}</span>
@@ -1485,21 +2723,16 @@ onBeforeUnmount(() => {
             <div class="manage-field"><span class="manage-label">BCH Address</span><span class="mono">{{ manageWalletDetails.address ?? 'Not available' }}</span></div>
             <div class="manage-field"><span class="manage-label">Token Address</span><span class="mono">{{ manageWalletDetails.tokenAddress ?? 'Not available' }}</span></div>
             <div class="manage-field"><span class="manage-label">Derivation</span><span>{{ manageWalletDetails.derivation ?? 'Not available' }}</span></div>
+            <div class="manage-quick-hint">
+              <strong><FontAwesomeIcon :icon="['fas', 'circle-info']" class="icon-btn" />Quick navigation:</strong>
+              <span>Use the Derivation tab to switch paths and the Seed Backup tab to reveal your seed phrase.</span>
+            </div>
             <div class="hint" v-if="manageWalletDetails.error">{{ manageWalletDetails.error }}</div>
           </template>
         </div>
 
-        <div class="manage-actions">
-          <button class="action-sheet-btn" @click="openManageDerivation">
-            <FontAwesomeIcon :icon="['fas', 'rotate']" class="icon-btn" />Change derivation
-          </button>
-          <button class="action-sheet-btn" @click="openManageBackup">
-            <FontAwesomeIcon :icon="['fas', 'key']" class="icon-btn" />Backup seed phrase
-          </button>
-        </div>
-
         <div class="manage-danger-zone">
-          <div class="manage-danger-title">Danger Zone</div>
+          <div class="manage-danger-title"><FontAwesomeIcon :icon="['fas', 'triangle-exclamation']" class="icon-btn" />Danger Zone</div>
           <div class="hint">Deleting removes this wallet from local device storage.</div>
           <button class="action-sheet-btn delete-wallet-btn" :disabled="manageWalletDetails?.isActive" @click="deleteManagedWallet">
             <FontAwesomeIcon :icon="['fas', 'xmark']" class="icon-btn" />Delete wallet
@@ -1514,29 +2747,34 @@ onBeforeUnmount(() => {
               <span class="manage-label">Current Derivation</span>
               <span>{{ manageWalletDetails?.derivation ?? activeDerivationPath }}</span>
             </div>
+            <p class="hint"><FontAwesomeIcon :icon="['fas', 'route']" class="icon-btn" />Selecting a preset applies instantly and reloads this wallet.</p>
             <div class="row">
               <label for="modal-derivation-select">New Derivation Path</label>
               <UiSelect
                 id="modal-derivation-select"
                 :model-value="derivationUpdateType"
                 :options="derivationOptions"
-                @update:modelValue="onDerivationUpdateTypeChange"
+                @update:modelValue="onDerivationUpdateTypeChangeAndApply"
               />
             </div>
             <div class="row" v-if="derivationUpdateType === 'custom'">
               <label for="modal-custom-derivation-input">Custom Path</label>
-              <input id="modal-custom-derivation-input" v-model="customDerivationPathUpdate" placeholder="m/44'/145'/0' or m/44'/145'/0'/0/0" />
+              <input
+                id="modal-custom-derivation-input"
+                v-model="customDerivationPathUpdate"
+                placeholder="m/44'/145'/0' or m/44'/145'/0'/0/0"
+                @change="applyCustomDerivationIfValid"
+                @keydown.enter.prevent="applyCustomDerivationIfValid"
+              />
             </div>
-            <button @click="updateActiveWalletDerivationPath" :disabled="isUpdatingDerivation || !activeSeedPhrase">
-              <FontAwesomeIcon :icon="['fas', 'rotate']" class="icon-btn" />
-              {{ isUpdatingDerivation ? 'Updating...' : 'Update Derivation & Reload' }}
-            </button>
+            <p class="hint" v-if="derivationUpdateType === 'custom'">Press Enter after typing a custom path to apply and reload.</p>
+            <p class="hint" v-if="isUpdatingDerivation">Updating derivation and reloading wallet...</p>
           </div>
         </template>
 
         <template v-else>
           <div class="manage-wallet-info">
-            <p class="hint">Reveal and save this seed phrase securely offline.</p>
+            <p class="hint"><FontAwesomeIcon :icon="['fas', 'key']" class="icon-btn" />Reveal and save this seed phrase securely offline.</p>
             <button @click="showSeedPhrase = !showSeedPhrase">
               <FontAwesomeIcon :icon="['fas', showSeedPhrase ? 'xmark' : 'plus']" class="icon-btn" />
               {{ showSeedPhrase ? 'Hide Seed Phrase' : 'Show Seed Phrase' }}
@@ -1549,7 +2787,7 @@ onBeforeUnmount(() => {
     </div>
 
     <div
-      v-if="createImportModalOpen"
+      v-if="activeOverlayScreen === 'create-import'"
       class="action-sheet-overlay"
       @click.self="closeCreateImportModal"
     >
@@ -1572,6 +2810,7 @@ onBeforeUnmount(() => {
           <div class="row">
             <label for="wallet-mode-select">Mode</label>
             <UiSelect
+              class="compact-select"
               id="wallet-mode-select"
               :model-value="mode"
               :options="modeOptions"
@@ -1581,6 +2820,7 @@ onBeforeUnmount(() => {
           <div class="row">
             <label for="wallet-type-select">Type</label>
             <UiSelect
+              class="compact-select"
               id="wallet-type-select"
               :model-value="importWalletType"
               :options="walletTypeOptions"
@@ -1595,6 +2835,7 @@ onBeforeUnmount(() => {
           <div class="row">
             <label for="wallet-derivation-select">Derivation Path</label>
             <UiSelect
+              class="compact-select"
               id="wallet-derivation-select"
               :model-value="derivationPathType"
               :options="derivationOptions"
@@ -1613,7 +2854,7 @@ onBeforeUnmount(() => {
     </div>
 
     <div
-      v-if="aboutModalOpen"
+      v-if="activeOverlayScreen === 'about'"
       class="action-sheet-overlay"
       @click.self="closeAboutModal"
     >
@@ -1649,7 +2890,7 @@ onBeforeUnmount(() => {
     </div>
 
     <div
-      v-if="receiveModalOpen"
+      v-if="activeOverlayScreen === 'receive'"
       class="action-sheet-overlay"
       @click.self="closeReceiveModal"
     >
@@ -1697,11 +2938,13 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@500;600;700&family=JetBrains+Mono:wght@500;700&display=swap');
+
 .app-shell {
   max-width: 1120px;
   margin: 0 auto;
   padding: 14px 14px calc(18px + env(safe-area-inset-bottom));
-  font-family: ui-sans-serif, -apple-system, Segoe UI, Roboto, sans-serif;
+  font-family: 'Manrope', 'Source Sans 3', 'Noto Sans', ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   font-size: 14px;
   color: #e6eefc;
   -webkit-text-size-adjust: 100%;
@@ -1738,33 +2981,188 @@ onBeforeUnmount(() => {
   z-index: -2;
   pointer-events: none;
 }
-h1 {
-  margin-top: 0;
-  font-size: 1.2rem;
-  line-height: 1.2;
+
+.topbar-simple {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  margin-bottom: 12px;
+  align-items: center;
 }
-.topbar {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
+
+.top-wallet-group {
+  display: inline-flex;
+  align-items: stretch;
+  min-width: 0;
+}
+
+.top-quick-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.top-wallet-btn,
+.top-connect-btn {
+  min-height: 42px;
+  border-radius: 12px;
+}
+
+.top-wallet-btn {
+  text-align: left;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+  flex: 1 1 auto;
+  border-radius: 0 12px 12px 0;
+  border-left: 0;
+}
+
+.top-receive-btn {
+  width: 42px;
+  min-width: 42px;
+  min-height: 42px;
+  padding: 0;
+  display: inline-grid;
+  place-items: center;
+  border-radius: 12px 0 0 12px;
+}
+
+.top-wallet-text {
+  display: grid;
+  gap: 1px;
+}
+
+.top-wallet-caption {
+  font-size: 0.68rem;
+  opacity: 0.78;
+  letter-spacing: 0.02em;
+}
+
+.top-wallet-current {
+  font-size: 0.88rem;
+  line-height: 1.1;
+}
+
+.top-connect-btn {
+  width: 42px;
+  min-width: 42px;
+  padding: 0;
+  display: inline-grid;
+  place-items: center;
+  position: relative;
+}
+
+.top-refresh-btn {
+  border-color: rgba(147, 197, 253, 0.5);
+}
+
+.top-connect-icon {
+  font-size: 0.95rem;
+  margin-right: 0;
+}
+
+.top-connect-btn.wc-connected {
+  border-color: rgba(110, 231, 183, 0.9);
+  background:
+    radial-gradient(circle at 20% 20%, rgba(110, 231, 183, 0.36), transparent 65%),
+    linear-gradient(155deg, rgba(6, 78, 59, 0.52), rgba(4, 47, 46, 0.5));
+  box-shadow: 0 0 0 1px rgba(110, 231, 183, 0.28), 0 0 18px rgba(52, 211, 153, 0.34);
+}
+
+.top-connect-btn.wc-connected .top-connect-icon {
+  color: #d1fae5;
+}
+
+.wc-connected-dot {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: #34d399;
+  box-shadow: 0 0 0 2px rgba(15, 23, 42, 0.95), 0 0 8px rgba(52, 211, 153, 0.85);
+  animation: wcConnectedPulse 1.8s ease-out infinite;
+}
+
+@keyframes wcConnectedPulse {
+  0% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  70% {
+    transform: scale(1.22);
+    opacity: 0.55;
+  }
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+.wc-pending-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 20px;
+  margin-left: 8px;
+  padding: 0 6px;
+  border-radius: 999px;
+  border: 1px solid rgba(134, 239, 172, 0.5);
+  background: rgba(20, 83, 45, 0.65);
+  color: #dcfce7;
+  font-size: 0.7rem;
+}
+
+.home-stack {
+  display: grid;
+  gap: 12px;
+}
+
+.glass-card {
+  width: 100%;
+  padding: 14px;
+  border: 1px solid rgba(148, 163, 184, 0.26);
+  border-radius: 14px;
+  background: rgba(15, 23, 42, 0.28);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  box-shadow: 0 10px 28px rgba(2, 6, 23, 0.22);
+}
+
+.active-wallet-card {
+  position: relative;
+  z-index: 2;
+  overflow: visible;
+}
+
+.active-wallet-card.dropdown-open {
+  z-index: 12;
+}
+
+.tokens-preview-card {
+  position: relative;
+  z-index: 1;
+}
+
+.tokens-preview-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
   gap: 10px;
   margin-bottom: 8px;
 }
-.header-brand-btn {
-  width: auto;
-  min-width: 0;
-  min-height: 0;
-  padding: 0;
-  border: 0;
-  background: transparent;
-  color: inherit;
-  box-shadow: none;
-  font: inherit;
-  font-weight: 700;
-  cursor: pointer;
+
+.tokens-preview-head h3 {
+  margin: 0;
 }
-.header-brand-btn:hover {
-  color: #c4e2ff;
+.tokens-preview-usd {
+  font-size: 0.78rem;
+  color: #cbd5e1;
+  white-space: nowrap;
 }
 .status-toast {
   position: fixed;
@@ -1773,24 +3171,24 @@ h1 {
   z-index: 70;
   max-width: min(84vw, 420px);
   padding: 8px 10px;
-  border: 1px solid rgba(191, 219, 254, 0.4);
+  align-items: center;
   border-radius: 10px;
   background: rgba(15, 23, 42, 0.92);
   color: #e2e8f0;
-  font-size: 0.75rem;
-  line-height: 1.25;
-  box-shadow: 0 10px 24px rgba(2, 6, 23, 0.34);
+  width: min(700px, 100%);
+  max-height: min(88dvh, 760px);
+  height: auto;
   backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
+  border-radius: 16px;
   overflow-wrap: anywhere;
 }
 .panel-grid {
   display: grid;
-  gap: 12px;
+  gap: 14px;
 }
 .panel {
   width: 100%;
-  padding: 14px;
+  padding: 15px;
   border: 1px solid rgba(148, 163, 184, 0.26);
   border-radius: 14px;
   background: rgba(15, 23, 42, 0.28);
@@ -1804,8 +3202,8 @@ h1 {
   margin: 0 0 10px;
 }
 .section-body {
-  margin-top: 8px;
-  padding: 8px 10px;
+  margin-top: 10px;
+  padding: 10px 12px;
   border: 1px solid rgba(191, 219, 254, 0.14);
   border-radius: 12px;
   background: rgba(15, 23, 42, 0.2);
@@ -1856,20 +3254,34 @@ h1 {
   padding-left: 0;
   margin: 0;
   display: grid;
-  gap: 8px;
+  gap: 0;
+}
+.wallet-list-panel {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-bottom: 6px;
+  max-height: min(56dvh, 460px);
 }
 .wallet-item {
   margin: 0;
-  padding: 6px 7px;
-  border: 1px solid rgba(148, 163, 184, 0.24);
-  border-radius: 8px;
-  background: rgba(15, 23, 42, 0.3);
+  padding: 2px 4px;
+  min-height: 34px;
+  border: 0;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 0;
+  background: transparent;
+  cursor: pointer;
+}
+.wallet-item:hover {
+  background: rgba(30, 41, 59, 0.28);
 }
 .wallet-item-main {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+  min-height: 30px;
 }
 .wallet-item-actions {
   display: flex;
@@ -1900,14 +3312,42 @@ h1 {
   font-size: 12px;
 }
 .wallet-row-btn {
-  min-height: 27px;
-  padding: 4px 7px;
+  min-height: 24px;
+  padding: 2px 6px;
   font-size: 11px;
+}
+.wallet-list-modal {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  min-height: 0;
+  overflow: auto;
+}
+.wallet-list-modal > .action-sheet-btn {
+  margin-top: 6px;
+}
+.active-derivation-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.active-derivation-btn {
+  width: auto;
+  min-height: 28px;
+  padding: 4px 8px;
+  white-space: nowrap;
+}
+.active-derivation-editor {
+  margin-top: 8px;
+  padding: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.28);
 }
 .action-sheet-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(2, 6, 23, 0.5);
+  background: rgba(2, 6, 23, 0.72);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1915,7 +3355,10 @@ h1 {
   padding: 12px;
 }
 .action-sheet {
-  width: min(520px, 100%);
+  width: min(700px, 100%);
+  max-height: min(88dvh, 760px);
+  height: auto;
+  margin: 0;
   border-radius: 16px;
   border: 1px solid rgba(191, 219, 254, 0.4);
   background: linear-gradient(160deg, rgba(30, 41, 59, 0.95), rgba(15, 23, 42, 0.92));
@@ -1927,6 +3370,7 @@ h1 {
   box-shadow: 0 18px 40px rgba(2, 6, 23, 0.52), inset 0 1px 0 rgba(255, 255, 255, 0.16);
   color: #fff;
   animation: modal-pop 180ms ease-out;
+  overflow-y: auto;
 }
 .action-sheet-header {
   display: flex;
@@ -1951,6 +3395,9 @@ h1 {
   gap: 6px;
 }
 .tab-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   min-width: 0;
   width: auto;
   min-height: 30px;
@@ -1980,14 +3427,86 @@ h1 {
   gap: 7px;
   font-size: 0.86rem;
 }
+.action-sheet .manage-wallet-info {
+  padding: 8px;
+  gap: 6px;
+  font-size: 0.82rem;
+}
+.action-sheet .row {
+  gap: 4px;
+  margin-bottom: 8px;
+}
+.action-sheet label {
+  font-size: 0.76rem;
+}
+.action-sheet input,
+.action-sheet textarea,
+.action-sheet select {
+  min-height: 32px;
+  padding: 5px 7px;
+  font-size: 13px;
+}
+.action-sheet select {
+  min-height: 32px;
+  font-size: 13px;
+  padding-right: 24px;
+}
+.action-sheet button {
+  min-height: 32px;
+  padding: 5px 9px;
+  font-size: 0.8rem;
+}
+.action-sheet .tiny-btn,
+.action-sheet .wallet-row-btn,
+.action-sheet .token-send-btn,
+.action-sheet .token-copy-btn,
+.action-sheet .inline-copy-btn {
+  min-height: 22px;
+  min-width: 22px;
+  padding: 1px 5px;
+}
+.action-sheet .action-sheet-btn {
+  min-height: 32px;
+  font-size: 0.8rem;
+}
+.action-sheet .tab-btn {
+  min-height: 26px;
+  padding: 3px 8px;
+  font-size: 0.74rem;
+}
 .create-import-modal {
-  width: min(620px, 100%);
+  gap: 8px;
+  grid-template-rows: auto minmax(0, 1fr) auto;
 }
-.about-modal {
-  width: min(640px, 100%);
+.create-import-modal .manage-wallet-info {
+  padding: 6px 8px;
+  gap: 4px;
 }
-.receive-modal {
-  width: min(560px, 100%);
+.create-import-modal .row {
+  gap: 3px;
+  margin: 0 0 6px;
+}
+.create-import-modal .row:last-child {
+  margin-bottom: 0;
+}
+.create-import-modal label {
+  font-size: 0.72rem;
+  line-height: 1.15;
+}
+.create-import-modal input,
+.create-import-modal textarea,
+.create-import-modal select {
+  min-height: 30px;
+  padding: 4px 6px;
+  font-size: 12px;
+}
+.create-import-modal textarea {
+  min-height: 64px;
+}
+.create-import-modal .action-sheet-btn {
+  min-height: 30px;
+  font-size: 0.78rem;
+  padding: 5px 8px;
 }
 .manage-wallet-badges {
   display: flex;
@@ -2004,9 +3523,13 @@ h1 {
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
-.manage-actions {
+.manage-quick-hint {
   display: grid;
-  gap: 7px;
+  gap: 2px;
+  padding: 8px;
+  border: 1px solid rgba(125, 211, 252, 0.28);
+  border-radius: 8px;
+  background: rgba(30, 64, 175, 0.14);
 }
 .manage-danger-zone {
   border: 1px solid rgba(248, 113, 113, 0.35);
@@ -2040,6 +3563,11 @@ h1 {
   min-height: 38px;
   padding: 0;
 }
+.action-sheet .icon-close {
+  min-width: 32px;
+  width: 32px;
+  min-height: 32px;
+}
 .seed-phrase {
   margin-top: 8px;
   padding: 8px;
@@ -2049,8 +3577,8 @@ h1 {
 }
 .row {
   display: grid;
-  gap: 6px;
-  margin-bottom: 10px;
+  gap: 7px;
+  margin-bottom: 12px;
 }
 label {
   font-weight: 600;
@@ -2087,9 +3615,12 @@ button {
   max-width: 100%;
   box-sizing: border-box;
   padding: 8px 12px;
-  border: 1px solid rgba(147, 197, 253, 0.55);
+  border: 1px solid rgba(125, 211, 252, 0.42);
   border-radius: 8px;
-  background: linear-gradient(180deg, rgba(59, 130, 246, 0.72), rgba(37, 99, 235, 0.62));
+  background: linear-gradient(155deg, rgba(20, 83, 45, 0.36), rgba(6, 78, 59, 0.38));
+  backdrop-filter: blur(6px) saturate(120%);
+  -webkit-backdrop-filter: blur(6px) saturate(120%);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.14), 0 4px 14px rgba(2, 6, 23, 0.2);
   color: #fff;
   cursor: pointer;
   min-height: 36px;
@@ -2097,14 +3628,89 @@ button {
   font-size: 0.92rem;
 }
 button:disabled {
-  background: rgba(148, 163, 184, 0.4);
-  border-color: rgba(148, 163, 184, 0.5);
+  background: rgba(51, 65, 85, 0.45);
+  border-color: rgba(148, 163, 184, 0.35);
+  box-shadow: none;
   cursor: not-allowed;
 }
 .meta {
-  margin-top: 10px;
+  margin-top: 12px;
   display: grid;
+  gap: 10px;
+}
+.address-grid {
+  display: grid;
+  gap: 10px;
+}
+.address-card {
+  border: 1px solid rgba(125, 211, 252, 0.26);
+  border-radius: 12px;
+  background: linear-gradient(155deg, rgba(14, 26, 48, 0.72), rgba(15, 23, 42, 0.42));
+  padding: 10px;
+}
+.address-card-bch {
+  border-color: rgba(56, 189, 248, 0.45);
+  box-shadow: inset 0 0 0 1px rgba(125, 211, 252, 0.2);
+}
+.address-card-token {
+  border-color: rgba(45, 212, 191, 0.45);
+  box-shadow: inset 0 0 0 1px rgba(94, 234, 212, 0.2);
+}
+.address-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   gap: 8px;
+}
+.address-title-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.address-head-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.address-icon-wrap {
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+  border: 1px solid rgba(125, 211, 252, 0.35);
+  display: inline-grid;
+  place-items: center;
+  color: #67e8f9;
+  background: rgba(2, 6, 23, 0.48);
+}
+.address-title-stack {
+  display: grid;
+  gap: 1px;
+}
+.address-title {
+  font-family: inherit;
+  font-weight: 700;
+  font-size: 0.76rem;
+  letter-spacing: 0.03em;
+  color: #e0f2fe;
+}
+.address-subtitle {
+  font-size: 0.66rem;
+  color: #93c5fd;
+}
+.address-copy-btn {
+  border-color: rgba(147, 197, 253, 0.38);
+  background: linear-gradient(180deg, rgba(30, 64, 175, 0.48), rgba(30, 58, 138, 0.42));
+}
+.address-value {
+  margin-top: 8px;
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.76rem;
+  line-height: 1.35;
+  color: #ccfbf1;
+  text-shadow: 0 0 10px rgba(45, 212, 191, 0.16);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .meta-head-inline {
   display: flex;
@@ -2129,6 +3735,88 @@ button:disabled {
   gap: 8px;
   flex-wrap: wrap;
 }
+.send-asset-modal.send-asset-modal-token {
+  overflow: hidden;
+  grid-template-rows: auto auto minmax(0, 1fr);
+}
+.send-history-card {
+  margin-top: 0;
+  display: grid;
+  gap: 7px;
+}
+.send-asset-modal-token .send-history-card {
+  min-height: 0;
+  overflow: hidden;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+.send-history-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.send-history-head strong {
+  display: inline-flex;
+  align-items: center;
+  font-size: 0.8rem;
+}
+.send-history-body {
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+.send-history-list {
+  display: grid;
+  gap: 6px;
+}
+.send-history-item {
+  padding: 7px 8px;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.32);
+  display: grid;
+  gap: 3px;
+}
+.send-history-item-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 0.78rem;
+}
+.send-history-top-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.send-history-open-btn {
+  width: 22px;
+  min-width: 22px;
+  min-height: 22px;
+  padding: 0;
+  display: inline-grid;
+  place-items: center;
+}
+.send-history-direction {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  opacity: 0.88;
+}
+.send-history-direction.sent {
+  color: #fca5a5;
+}
+.send-history-direction.received {
+  color: #86efac;
+}
+.send-history-item-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 0.66rem;
+  color: #bfdbfe;
+}
 .receive-qr-wrap {
   margin-top: 6px;
   border: 1px solid rgba(148, 163, 184, 0.3);
@@ -2143,25 +3831,6 @@ button:disabled {
   width: min(250px, 72vw);
   height: auto;
   border-radius: 8px;
-}
-.send-box {
-  margin-top: 6px;
-  padding-top: 10px;
-  border-top: 1px solid rgba(148, 163, 184, 0.22);
-  display: grid;
-  gap: 4px;
-}
-.send-box h3 {
-  margin: 0 0 8px;
-}
-.send-box-body {
-  margin-top: 8px;
-  padding: 8px 10px;
-  border: 1px solid rgba(191, 219, 254, 0.14);
-  border-radius: 12px;
-  background: rgba(15, 23, 42, 0.18);
-  backdrop-filter: blur(7px);
-  -webkit-backdrop-filter: blur(7px);
 }
 table {
   width: 100%;
@@ -2196,31 +3865,112 @@ td {
   gap: 0;
 }
 .token-card {
+  display: grid;
+  grid-template-columns: 26px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
   border: 0;
   border-bottom: 1px solid rgba(148, 163, 184, 0.22);
   background: transparent;
   border-radius: 0;
-  padding: 5px 0;
+  height: 42px;
+  padding: 3px 0;
+  overflow: hidden;
+}
+.token-icon-slot {
+  width: 24px;
+  height: 24px;
+  min-width: 24px;
+  min-height: 24px;
+  max-width: 24px;
+  max-height: 24px;
+  flex: 0 0 24px;
+  border-radius: 8px;
+  display: inline-grid;
+  place-items: center;
+  border: 1px solid rgba(191, 219, 254, 0.24);
+  background: rgba(30, 41, 59, 0.38);
+  color: #bae6fd;
+  font-size: 0.78rem;
+}
+.token-icon-btn {
+  padding: 0;
+  cursor: pointer;
+  width: 24px;
+  height: 24px;
+  min-width: 24px;
+  min-height: 24px;
+  max-width: 24px;
+  max-height: 24px;
+}
+.token-icon-btn.copied {
+  border-color: rgba(125, 211, 252, 0.7);
+  box-shadow: 0 0 0 1px rgba(125, 211, 252, 0.4);
+}
+.token-icon-image {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 7px;
+}
+.token-info-grid {
+  min-width: 0;
+  display: grid;
+  gap: 1px;
 }
 .token-main-line {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   justify-content: space-between;
   gap: 8px;
+  min-width: 0;
+  white-space: nowrap;
 }
 .token-card-title {
-  font-size: 0.9rem;
+  font-size: 0.8rem;
   font-weight: 600;
   margin-bottom: 0;
+  min-width: 0;
+  flex: 1 1 auto;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.token-quick-stats {
+.token-favorite-badge {
   display: inline-flex;
-  align-items: baseline;
-  gap: 6px;
+  align-items: center;
+  margin-right: 5px;
+  color: #facc15;
+  font-size: 0.65rem;
+  vertical-align: middle;
+}
+.token-quick-stats {
+  display: none;
+}
+.token-usd-value {
+  flex: 0 0 auto;
   font-size: 0.78rem;
+  white-space: nowrap;
+}
+.token-sub-line {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+.token-price-source {
+  min-width: 0;
+  font-size: 0.54rem;
+  opacity: 0.72;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.token-amount-main {
+  flex: 0 0 auto;
+  font-size: 0.58rem;
+  opacity: 0.86;
   white-space: nowrap;
 }
 .token-nft-mini {
@@ -2228,28 +3978,35 @@ td {
   font-size: 0.68rem;
 }
 .token-id {
-  font-size: 0.68rem;
+  font-size: 0.64rem;
   opacity: 0.7;
   margin-top: 0;
   margin-bottom: 0;
+  display: inline-block;
+  max-width: 66px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .token-id-btn {
   width: auto;
-  min-width: 0;
   min-height: 0;
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  padding: 1px 0;
+  padding: 0;
   border: 0;
   background: transparent;
   margin-bottom: 0;
-  min-width: auto;
+  min-width: 0;
+  max-width: 92px;
+  overflow: hidden;
   color: #dbeafe;
 }
 .token-id-copy {
   font-size: 0.62rem;
   opacity: 0.62;
+  display: none;
 }
 .copy-check {
   width: 8px;
@@ -2268,12 +4025,74 @@ td {
   color: #7dd3fc;
   opacity: 0.95;
 }
+.token-actions-line {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+.token-send-btn {
+  min-height: 20px;
+  min-width: 20px;
+  padding: 1px 4px;
+}
+.token-favorite-btn,
+.token-hide-btn,
+.token-unhide-btn {
+  min-height: 20px;
+  min-width: 20px;
+  padding: 1px 4px;
+}
+.token-favorite-btn.active {
+  border-color: rgba(250, 204, 21, 0.6);
+  color: #facc15;
+  background: linear-gradient(180deg, rgba(120, 53, 15, 0.5), rgba(92, 40, 11, 0.42));
+}
+.token-hide-btn {
+  border-color: rgba(248, 113, 113, 0.5);
+  color: #fecaca;
+  background: linear-gradient(180deg, rgba(153, 27, 27, 0.44), rgba(127, 29, 29, 0.36));
+}
+.token-unhide-btn {
+  border-color: rgba(110, 231, 183, 0.5);
+  color: #a7f3d0;
+  background: linear-gradient(180deg, rgba(6, 95, 70, 0.48), rgba(4, 78, 58, 0.4));
+}
+.token-copy-btn {
+  min-height: 20px;
+  min-width: 20px;
+  padding: 1px 4px;
+}
+.token-copy-btn.copied {
+  color: #7dd3fc;
+  border-color: rgba(125, 211, 252, 0.5);
+}
 .token-card-row {
   display: flex;
   justify-content: space-between;
   align-items: baseline;
   gap: 8px;
   font-size: 0.82rem;
+}
+.hidden-token-panel {
+  margin-top: 8px;
+  border-top: 1px dashed rgba(148, 163, 184, 0.36);
+  padding-top: 8px;
+  display: grid;
+  gap: 6px;
+}
+.hidden-token-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.hidden-token-panel-head strong {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.78rem;
 }
 @keyframes copy-check-pop {
   0% {
@@ -2293,12 +4112,261 @@ ul {
   list-style: none;
   padding-left: 0;
 }
-li {
+.wallet-connect-modal {
+  gap: 9px;
+  font-family: inherit;
+}
+.wallet-connect-modal .manage-wallet-info {
+  border: 1px solid rgba(148, 163, 184, 0.26);
+  border-radius: 14px;
+  background: rgba(15, 23, 42, 0.28);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  box-shadow: 0 10px 28px rgba(2, 6, 23, 0.22);
+}
+.wc-modal-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  letter-spacing: 0.03em;
+}
+.wc-title-icon {
+  color: #7dd3fc;
+  font-size: 1.02rem;
+}
+.wallet-connect-modal .manage-label {
+  color: #bae6fd;
+}
+.wallet-connect-modal .hint {
+  color: #dbeafe;
+}
+.wc-overview-card {
+  background: rgba(15, 23, 42, 0.24);
+}
+.wc-overview-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+.wc-overview-item {
+  border: 1px solid rgba(191, 219, 254, 0.14);
+  border-radius: 9px;
+  padding: 7px 8px;
+  background: rgba(15, 23, 42, 0.2);
+  display: grid;
+  gap: 2px;
+}
+.wc-overview-item.active {
+  border-color: rgba(110, 231, 183, 0.5);
+  box-shadow: inset 3px 0 0 rgba(110, 231, 183, 0.55);
+}
+.wc-overview-item.pending {
+  border-color: rgba(251, 191, 36, 0.5);
+  box-shadow: inset 3px 0 0 rgba(251, 191, 36, 0.65);
+}
+.wc-overview-item strong {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.82rem;
+  color: #f0f9ff;
+}
+.wc-overview-icon {
+  color: #7dd3fc;
+  font-size: 0.92rem;
+}
+.wc-overview-hint {
+  margin: 0;
+}
+.wc-pending-card {
+  background: rgba(15, 23, 42, 0.24);
+}
+.wc-connection-proposal-card {
+  background: rgba(15, 23, 42, 0.24);
+}
+.wc-proposal-dapp {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.wc-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.wc-section-title-wrap {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+.wc-section-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 0.85rem;
+  color: #f0f9ff;
+  letter-spacing: 0.02em;
+}
+.wc-section-icon {
+  color: #67e8f9;
+  font-size: 0.92rem;
+}
+.wc-method-pill {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  border-radius: 999px;
+  padding: 2px 8px;
+  border: 0;
+  background: rgba(30, 64, 175, 0.28);
+  font-size: 0.74rem;
+}
+.wc-approval-actions button {
+  flex: 1 1 180px;
+}
+.wc-connect-card {
+  background: rgba(15, 23, 42, 0.24);
+}
+.wc-uri-row {
+  margin-bottom: 4px;
+  padding: 9px;
+  border: 1px solid rgba(125, 211, 252, 0.28);
+  border-radius: 10px;
+  background: rgba(30, 64, 175, 0.14);
+  box-shadow: inset 2px 0 0 rgba(125, 211, 252, 0.48);
+}
+.wc-uri-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.8rem;
+  font-weight: 700;
+  color: #e0f2fe;
+  letter-spacing: 0.02em;
+}
+.wc-uri-input {
+  background: rgba(2, 6, 23, 0.72);
+  border-color: rgba(125, 211, 252, 0.68);
+  color: #f8fafc;
+  min-height: 38px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+.wc-uri-input::placeholder {
+  color: rgba(191, 219, 254, 0.86);
+}
+.wc-uri-input:focus {
+  outline: none;
+  border-color: rgba(103, 232, 249, 0.9);
+  box-shadow: 0 0 0 2px rgba(34, 211, 238, 0.25), inset 0 1px 0 rgba(255, 255, 255, 0.1);
+}
+.wc-uri-hint {
+  margin: -1px 0 0;
+  color: #bfdbfe;
+}
+.wc-connected-summary {
+  display: grid;
+  gap: 7px;
+  padding: 8px 9px;
+  border: 1px solid rgba(191, 219, 254, 0.14);
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.2);
+}
+.wc-inline-icon {
+  color: #67e8f9;
+  font-size: 0.9rem;
+  margin-right: 5px;
+}
+.wc-sessions-card {
+  background: rgba(15, 23, 42, 0.24);
+}
+.wc-empty-state {
+  border: 1px solid rgba(191, 219, 254, 0.14);
+  border-radius: 9px;
+  padding: 10px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: rgba(15, 23, 42, 0.2);
+}
+.wc-empty-icon {
+  color: #93c5fd;
+  font-size: 1rem;
+}
+.wc-empty-state strong {
+  display: block;
+  font-size: 0.8rem;
+}
+.wc-empty-state .hint {
+  margin: 2px 0 0;
+}
+.wc-session-list li {
   margin-bottom: 12px;
   padding: 10px;
-  border: 1px solid rgba(148, 163, 184, 0.24);
+  border: 1px solid rgba(191, 219, 254, 0.14);
   border-radius: 8px;
-  background: rgba(15, 23, 42, 0.3);
+  background: rgba(15, 23, 42, 0.2);
+}
+.wc-session-item {
+  margin-bottom: 10px;
+}
+.wc-session-item:last-child {
+  margin-bottom: 0;
+}
+.wc-session-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.wc-dapp-avatar {
+  width: 24px;
+  height: 24px;
+  min-width: 24px;
+  border-radius: 6px;
+  background: rgba(30, 41, 59, 0.55);
+  display: inline-grid;
+  place-items: center;
+  overflow: hidden;
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: #cbd5e1;
+}
+.wc-dapp-avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.wc-dapp-meta {
+  min-width: 0;
+  display: grid;
+  gap: 1px;
+}
+.wc-dapp-meta strong {
+  font-size: 0.8rem;
+  line-height: 1.1;
+}
+.wc-dapp-meta .hint {
+  font-size: 0.68rem;
+}
+.wc-disconnect-btn {
+  margin-left: auto;
+  white-space: nowrap;
+}
+.wc-session-stats {
+  margin-top: 5px;
+  display: grid;
+  gap: 2px;
+  font-size: 0.7rem;
+  opacity: 0.86;
+}
+.wc-stat-icon {
+  color: #93c5fd;
+  margin-right: 5px;
+  font-size: 0.78rem;
+}
+.wc-account-line {
+  margin-top: 4px;
+  font-size: 0.68rem;
 }
 .mono {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -2343,12 +4411,9 @@ hr {
   .panel {
     padding: 10px;
   }
-  h1 {
-    font-size: 1rem;
-  }
-  .topbar {
-    align-items: center;
-    margin-bottom: 8px;
+  .topbar-simple {
+    grid-template-columns: minmax(0, 1fr) auto;
+    margin-bottom: 10px;
   }
   .status-toast {
     right: 8px;
@@ -2364,36 +4429,34 @@ hr {
     font-size: 0.95rem;
   }
   button {
-    min-height: 34px;
-    padding: 6px 9px;
-    font-size: 0.88rem;
+    border-radius: 10px;
   }
-  input,
-  textarea,
-  select {
-    min-height: 36px;
-    padding: 6px 8px;
-    font-size: 14px;
+  .compact-mobile .panel {
+    padding: 9px;
   }
-  select {
-    min-height: 40px;
-    font-size: 16px;
-    padding: 8px 10px;
-    padding-right: 30px;
+  .compact-mobile .row {
+    margin-bottom: 7px;
   }
-  .mono {
-    font-size: 0.74rem;
+  .compact-mobile button {
+    min-height: 38px;
   }
-  .token-card-title {
-    font-size: 0.84rem;
+  .panel {
+    border-radius: 14px;
   }
-  .token-quick-stats {
-    font-size: 0.72rem;
+  .collapse-toggle {
+    min-height: 44px;
+    border-radius: 12px;
+  }
+  .section-body {
+    padding: 10px;
+  }
+  .manager-body {
+    padding: 10px;
+  }
+  .meta .mono {
+    font-size: 0.78rem;
   }
   .token-nft-mini {
-    font-size: 0.64rem;
-  }
-  .token-id {
     font-size: 0.64rem;
   }
   .token-id-copy {
@@ -2410,12 +4473,40 @@ hr {
     padding: 8px;
   }
   .action-sheet {
+    width: min(640px, 100%);
+    max-height: 92dvh;
     border-radius: 12px;
-    padding: 8px;
+    padding: 10px;
+    backdrop-filter: blur(10px) saturate(125%);
+    -webkit-backdrop-filter: blur(10px) saturate(125%);
+    background: linear-gradient(160deg, rgba(30, 41, 59, 0.95), rgba(15, 23, 42, 0.92));
+    box-shadow: 0 18px 40px rgba(2, 6, 23, 0.52), inset 0 1px 0 rgba(255, 255, 255, 0.16);
   }
   .action-sheet-btn {
     min-height: 40px;
     font-size: 0.9rem;
+  }
+  .wc-overview-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 6px;
+  }
+  .wc-overview-item {
+    padding: 6px;
+  }
+  .wc-overview-item strong {
+    font-size: 0.74rem;
+    gap: 4px;
+  }
+}
+
+@media (min-width: 860px) {
+  .action-sheet-overlay {
+    padding: 12px;
+  }
+  .action-sheet {
+    width: min(720px, 100%);
+    max-height: min(86dvh, 760px);
+    border-radius: 16px;
   }
 }
 
@@ -2455,9 +4546,6 @@ hr {
     min-width: 140px;
   }
   .token-cards {
-    display: none;
-  }
-  .desktop-table {
     display: block;
   }
 }
