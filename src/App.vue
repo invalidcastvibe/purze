@@ -431,7 +431,7 @@ const assetItems = computed<AssetItem[]>(() => {
 
   return [bchAsset, ...tokenAssets];
 });
-const previewAssets = computed(() => assetItems.value.slice(0, 20));
+const previewAssets = computed(() => assetItems.value.slice(0, 100));
 const currentWalletButtonLabel = computed(() => activeWalletName.value || 'Select Wallet');
 const pendingWcApproval = computed(() => pendingWcRequests.value[0] ?? null);
 const hasPendingWcConnectionProposal = computed(() => pendingWcConnectionProposal.value !== null);
