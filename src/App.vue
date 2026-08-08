@@ -5,7 +5,7 @@ import { IndexedDBProvider } from '@mainnet-cash/indexeddb-storage';
 import type { IWalletKit, WalletKitTypes } from '@reown/walletkit';
 import { binToHex, encodeLockingBytecodeP2pkh, secp256k1, sha256 } from '@bitauth/libauth';
 import type { WcSignMessageRequest, WcSignTransactionRequest } from '@bch-wc2/interfaces';
-import { DERIVATION_PATHS, type DerivationPathType, resolveDerivationPaths } from './lib/derivation';
+import { DERIVATION_PATHS, DERIVATION_SCAN_CANDIDATES, type DerivationPathType, resolveDerivationPaths } from './lib/derivation';
 import UiSelect from './components/UiSelect.vue';
 
 type WalletKind = 'single' | 'hd';
@@ -41,8 +41,23 @@ type TokenMetadata = {
   iconUri?: string;
 };
 
+type DerivationScanResult = {
+  label: string;
+  parent: string;
+  full: string;
+  address: string;
+  balanceSats: bigint;
+  tokenSummary: string;
+  error?: string;
+};
+
 type UsdRateCache = {
   rate: number;
+  updatedAt: number;
+};
+
+type FiatRateCache = {
+  rates: Record<string, number>;
   updatedAt: number;
 };
 
@@ -141,19 +156,34 @@ type AssetItem = {
 };
 
 type MobilePanel = 'wallet' | 'tokens' | 'manager' | 'walletconnect';
-type OverlayScreen = 'none' | 'wallet-list' | 'token-list' | 'send-asset' | 'wallet-connect' | 'manage-wallet' | 'create-import' | 'about' | 'receive';
+type OverlayScreen = 'none' | 'wallet-list' | 'token-list' | 'send-asset' | 'wallet-connect' | 'manage-wallet' | 'create-import' | 'about' | 'receive' | 'notifications';
 
 const WALLETCONNECT_PROJECT_ID = '3fd234b8e2cd0e1da4bc08a0011bbf64';
 const TOKEN_NAME_CACHE_STORAGE_KEY = 'slim.tokenNameCache.v2';
 const USD_RATE_CACHE_STORAGE_KEY = 'slim.usdRateCache.v1';
+const FIAT_RATE_CACHE_STORAGE_KEY = 'slim.fiatRateCache.v1';
+const FIAT_CURRENCY_STORAGE_KEY = 'slim.fiatCurrency.v1';
 const HIDDEN_TOKEN_CATEGORIES_STORAGE_KEY = 'slim.hiddenTokenCategories.v1';
+const COINPAPRIKA_BCH_TICKER_URL = 'https://api.coinpaprika.com/v1/tickers/bch-bitcoin-cash';
 const FAVORITE_TOKEN_CATEGORIES_STORAGE_KEY = 'slim.favoriteTokenCategories.v1';
 const NOTIFICATION_SETTINGS_STORAGE_KEY = 'slim.notificationSettings.v1';
 const NOTIFICATION_EVENTS_STORAGE_KEY = 'slim.notificationEvents.v1';
 const IPFS_GATEWAY = 'https://dweb.link/ipfs/';
+const IPFS_GATEWAYS_LIST = [
+  'https://dweb.link/ipfs/',
+  'https://ipfs.io/ipfs/',
+  'https://cloudflare-ipfs.com/ipfs/',
+  'https://gateway.pinata.cloud/ipfs/',
+];
+const BCH_ICON_URI = 'https://bitcoincash.org/img/green/bitcoin-cash-circle.svg';
 const MAX_TOKEN_NAME_CACHE_ENTRIES = 350;
+const SUPPORTED_FIAT_CURRENCIES = ['USD', 'EUR', 'GBP', 'JPY', 'AUD', 'CAD', 'CHF', 'CNY', 'INR', 'PHP'];
+const DEFAULT_FIAT_CURRENCY = 'USD';
 const USD_RATE_CACHE_TTL_DESKTOP_MS = 2 * 60 * 1000;
 const USD_RATE_CACHE_TTL_MOBILE_MS = 6 * 60 * 1000;
+const USD_FIAT_RATE_API_KEY = 'bec0eef0773f6adde5c947ba';
+const USD_FIAT_RATE_API_URL = `https://v6.exchangerate-api.com/v6/${USD_FIAT_RATE_API_KEY}/latest/USD`;
+const USD_FIAT_RATE_FALLBACK_URL = `https://api.exchangerate.host/latest?base=USD&symbols=${SUPPORTED_FIAT_CURRENCIES.join(',')}`;
 
 const walletConnectRuntime = globalThis as typeof globalThis & {
   __purzeWalletConnectCore?: unknown;
@@ -176,6 +206,9 @@ const importWalletType = ref<WalletKind>('single');
 const derivationPathType = ref<DerivationPathType>('standard');
 const customDerivationPath = ref('');
 const showSeedPhrase = ref(false);
+const derivationScanResults = ref<DerivationScanResult[]>([]);
+const isScanningDerivations = ref(false);
+const derivationScanMessage = ref('');
 const derivationUpdateType = ref<DerivationPathType>('standard');
 const customDerivationPathUpdate = ref('');
 const isUpdatingDerivation = ref(false);
@@ -192,6 +225,10 @@ const managerMode = ref<'none' | 'backup' | 'derivation'>('none');
 const bchBalance = ref<bigint>(0n);
 const usdBalance = ref<number | null>(null);
 const bchUsdRate = ref<number | null>(null);
+const fiatCurrency = ref<string>(DEFAULT_FIAT_CURRENCY);
+const usdToFiatRate = ref<number>(1);
+const fiatBalance = ref<number | null>(null);
+const fiatRateCache = ref<FiatRateCache | null>(null);
 const walletAddress = ref('');
 const tokenWalletAddress = ref('');
 const tokenList = ref<TokenSummary[]>([]);
@@ -226,6 +263,8 @@ const failedIconUris = ref<Record<string, true>>({});
 let copiedTokenTimer: ReturnType<typeof setTimeout> | null = null;
 const notificationMenuOpen = ref(false);
 const notificationMenuEl = ref<HTMLElement | null>(null);
+const notificationIsInFooter = ref(false);
+const notificationMenuStyle = ref<Record<string, string> | null>(null);
 const notificationSettings = ref<Record<NotificationSettingKey, boolean>>({
   sendFunds: true,
   receiveFunds: true,
@@ -236,6 +275,29 @@ const previousBchBalance = ref<bigint | null>(null);
 const previousTokenTotals = ref<Record<string, bigint>>({});
 const hasNotificationBalanceBaseline = ref(false);
 const walletModalView = ref<'wallets' | 'notifications'>('wallets');
+const notificationPanelView = ref<'list' | 'settings'>('list');
+const notificationListFilter = ref<'unread' | 'all'>('unread');
+const notificationPage = ref(1);
+const notificationPageSize = ref(8);
+
+const filteredNotificationEvents = computed(() => {
+  const byType = notificationEvents.value.filter((item) => notificationSettings.value[item.type]);
+  if (notificationListFilter.value === 'unread') {
+    return byType.filter((i) => !i.read);
+  }
+  return byType;
+});
+
+const notificationTotalPages = computed(() => Math.max(1, Math.ceil(filteredNotificationEvents.value.length / notificationPageSize.value)));
+const displayedNotifications = computed(() => {
+  const page = Math.max(1, Math.min(notificationPage.value, notificationTotalPages.value));
+  const start = (page - 1) * notificationPageSize.value;
+  return filteredNotificationEvents.value.slice(start, start + notificationPageSize.value);
+});
+
+watch([notificationListFilter, filteredNotificationEvents], () => {
+  notificationPage.value = 1;
+});
 
 const wcUri = ref('');
 const walletKit = ref<IWalletKit | null>(null);
@@ -286,6 +348,20 @@ const activeSeedPhrase = computed(() => {
   return w?.mnemonic ?? null;
 });
 
+const currencyOptions = computed<SelectOption[]>(() =>
+  SUPPORTED_FIAT_CURRENCIES.map((currency) => ({ value: currency, label: currency })),
+);
+
+async function onFiatCurrencyChange(value: string) {
+  if (!SUPPORTED_FIAT_CURRENCIES.includes(value)) return;
+  fiatCurrency.value = value;
+  persistFiatCurrency();
+
+  fiatRateCache.value = null;
+  await updateFiatRate(true);
+  fiatBalance.value = usdBalance.value !== null ? usdBalance.value * usdToFiatRate.value : null;
+}
+
 function isTokenCategoryHidden(category?: string): boolean {
   return !!category && hiddenTokenCategories.value[category] === true;
 }
@@ -313,7 +389,7 @@ function toTokenAssetItem(token: TokenSummary): AssetItem {
     symbol: token.symbol,
     iconUri: token.iconUri,
     usdValueText: '--',
-    cauldronPriceText: 'Cauldron --',
+    cauldronPriceText: '--',
     amountText: formatTokenAmount(token.fungibleAmount, token.decimals),
     canSend: token.fungibleAmount > 0n,
     nftCount: token.nftCount,
@@ -344,8 +420,9 @@ const assetItems = computed<AssetItem[]>(() => {
     kind: 'bch',
     displayName: 'Bitcoin Cash',
     symbol: 'BCH',
-    usdValueText: formatUsdCompact(usdBalance.value),
-    cauldronPriceText: `Cauldron ${formatUsdCompact(bchUsdRate.value)}`,
+    iconUri: BCH_ICON_URI,
+    usdValueText: formatCurrency(fiatBalance.value),
+    cauldronPriceText: bchUsdRate.value === null ? '--' : formatCurrency(bchUsdRate.value * usdToFiatRate.value),
     amountText: `${formatBchFromSats(bchBalance.value)} BCH`,
     canSend: bchBalance.value > 0n,
   };
@@ -354,7 +431,7 @@ const assetItems = computed<AssetItem[]>(() => {
 
   return [bchAsset, ...tokenAssets];
 });
-const previewAssets = computed(() => assetItems.value.slice(0, 4));
+const previewAssets = computed(() => assetItems.value.slice(0, 20));
 const currentWalletButtonLabel = computed(() => activeWalletName.value || 'Select Wallet');
 const pendingWcApproval = computed(() => pendingWcRequests.value[0] ?? null);
 const hasPendingWcConnectionProposal = computed(() => pendingWcConnectionProposal.value !== null);
@@ -411,6 +488,25 @@ const notificationItems = computed(() => notificationEvents.value.filter((item) 
 const notificationCount = computed(() => notificationItems.value.length);
 const notificationUnreadIds = computed(() => new Set(notificationItems.value.map((item) => item.id)));
 
+function showBrowserNotification(entry: NotificationEventItem) {
+  if (typeof window === 'undefined' || !('Notification' in window)) return;
+  if (Notification.permission !== 'granted') return;
+
+  try {
+    const notification = new Notification(entry.label, {
+      body: entry.message,
+      tag: entry.id,
+      renotify: false,
+      silent: false,
+    });
+    notification.onclick = () => {
+      window.focus();
+    };
+  } catch {
+    // Ignore failures from the browser notification API.
+  }
+}
+
 function pushNotification(type: NotificationSettingKey, message: string) {
   const definition = allNotificationItems.find((item) => item.settingKey === type);
   if (!definition) return;
@@ -427,6 +523,7 @@ function pushNotification(type: NotificationSettingKey, message: string) {
   };
 
   notificationEvents.value = [entry, ...notificationEvents.value].slice(0, 60);
+  showBrowserNotification(entry);
 }
 
 function persistNotificationEvents() {
@@ -448,7 +545,11 @@ function setNotificationSetting(settingKey: NotificationSettingKey, enabled: boo
 function onNotificationSettingToggle(settingKey: NotificationSettingKey, event: Event) {
   const target = event.target;
   if (!(target instanceof HTMLInputElement)) return;
-  setNotificationSetting(settingKey, target.checked);
+  const enabled = target.checked;
+  setNotificationSetting(settingKey, enabled);
+  if (enabled) {
+    void ensureBrowserNotificationPermission();
+  }
 }
 
 async function ensureBrowserNotificationPermission() {
@@ -488,14 +589,34 @@ async function ensureBrowserNotificationPermission() {
 }
 
 function toggleNotificationMenu() {
-  notificationMenuOpen.value = !notificationMenuOpen.value;
-  if (notificationMenuOpen.value && notificationCount.value > 0) {
-    void ensureBrowserNotificationPermission();
+  if (notificationMenuOpen.value) {
+    notificationMenuOpen.value = false;
+    activeOverlayScreen.value = 'none';
+  } else {
+    notificationMenuOpen.value = true;
+    activeOverlayScreen.value = 'notifications';
+    if (hasEnabledNotificationTypes.value) {
+      void ensureBrowserNotificationPermission();
+    }
   }
+}
+
+function openNotificationSettings() {
+  activeOverlayScreen.value = 'notifications';
+  notificationMenuOpen.value = true;
+  notificationPanelView.value = 'settings';
+  void ensureBrowserNotificationPermission();
 }
 
 function closeNotificationMenu() {
   notificationMenuOpen.value = false;
+  activeOverlayScreen.value = 'none';
+}
+
+function openFullNotifications() {
+  notificationMenuOpen.value = false;
+  openWalletListModal();
+  setWalletModalView('notifications');
 }
 
 function handleNotificationClick(item: NotificationEventItem) {
@@ -546,6 +667,10 @@ function openWalletListModal() {
 
 function setWalletModalView(view: 'wallets' | 'notifications') {
   walletModalView.value = view;
+}
+
+function setNotificationPanelView(view: 'list' | 'settings') {
+  notificationPanelView.value = view;
 }
 
 function closeWalletListModal() {
@@ -872,6 +997,15 @@ function persistUsdRateCache() {
   localStorage.setItem(USD_RATE_CACHE_STORAGE_KEY, JSON.stringify(usdRateCache.value));
 }
 
+function persistFiatRateCache() {
+  if (!fiatRateCache.value) return;
+  localStorage.setItem(FIAT_RATE_CACHE_STORAGE_KEY, JSON.stringify(fiatRateCache.value));
+}
+
+function persistFiatCurrency() {
+  localStorage.setItem(FIAT_CURRENCY_STORAGE_KEY, fiatCurrency.value);
+}
+
 async function getBchUsdRateWithCache() {
   const now = Date.now();
   const ttl = isMobileView.value ? USD_RATE_CACHE_TTL_MOBILE_MS : USD_RATE_CACHE_TTL_DESKTOP_MS;
@@ -879,10 +1013,73 @@ async function getBchUsdRateWithCache() {
     return usdRateCache.value.rate;
   }
 
-  const nextRate = await convert(1, 'bch', 'usd');
-  usdRateCache.value = { rate: nextRate, updatedAt: now };
-  persistUsdRateCache();
-  return nextRate;
+  try {
+    const response = await fetch(COINPAPRIKA_BCH_TICKER_URL);
+    const data = await response.json();
+    const nextRate = typeof data?.quotes?.USD?.price === 'number' ? data.quotes.USD.price : null;
+    if (nextRate === null || Number.isNaN(nextRate)) {
+      throw new Error('Invalid BCH/USD rate from CoinPaprika');
+    }
+
+    usdRateCache.value = { rate: nextRate, updatedAt: now };
+    persistUsdRateCache();
+    return nextRate;
+  } catch {
+    const nextRate = await convert(1, 'bch', 'usd');
+    usdRateCache.value = { rate: nextRate, updatedAt: now };
+    persistUsdRateCache();
+    return nextRate;
+  }
+}
+
+async function getUsdToFiatRatesWithCache(forceRefresh = false) {
+  const now = Date.now();
+  const ttl = isMobileView.value ? USD_RATE_CACHE_TTL_MOBILE_MS : USD_RATE_CACHE_TTL_DESKTOP_MS;
+  if (!forceRefresh && fiatRateCache.value && now - fiatRateCache.value.updatedAt < ttl) {
+    return fiatRateCache.value.rates;
+  }
+
+  try {
+    const response = await fetch(USD_FIAT_RATE_API_URL);
+    const data = await response.json();
+    const rates = data?.rates ?? {};
+    const filteredRates: Record<string, number> = { USD: 1 };
+    for (const currency of SUPPORTED_FIAT_CURRENCIES) {
+      if (currency === 'USD') continue;
+      const rate = rates[currency];
+      if (typeof rate === 'number' && !Number.isNaN(rate)) {
+        filteredRates[currency] = rate;
+      }
+    }
+    fiatRateCache.value = { rates: filteredRates, updatedAt: now };
+    persistFiatRateCache();
+    return filteredRates;
+  } catch {
+    try {
+      const response = await fetch(USD_FIAT_RATE_FALLBACK_URL);
+      const data = await response.json();
+      const rates = data?.rates ?? { USD: 1 };
+      fiatRateCache.value = { rates, updatedAt: now };
+      persistFiatRateCache();
+      return rates;
+    } catch {
+      return { USD: 1 };
+    }
+  }
+}
+
+async function updateFiatRate(forceRefresh = false) {
+  if (fiatCurrency.value === 'USD') {
+    usdToFiatRate.value = 1;
+    return;
+  }
+
+  try {
+    const rates = await getUsdToFiatRatesWithCache(forceRefresh);
+    usdToFiatRate.value = rates[fiatCurrency.value] ?? 1;
+  } catch {
+    usdToFiatRate.value = 1;
+  }
 }
 
 function truncateTokenId(category: string): string {
@@ -1003,7 +1200,35 @@ function isAssetIconVisible(asset: AssetItem): boolean {
   return failedAssetIcons.value[asset.key] !== true;
 }
 
-function onAssetIconError(assetKey: string, assetIconUri?: string) {
+function onAssetIconError(evt: Event, assetKey: string, assetIconUri?: string) {
+  const img = evt?.target as HTMLImageElement | undefined;
+
+  // If the uri looks like an IPFS gateway URL, attempt rotate through fallbacks
+  try {
+    if (assetIconUri) {
+      const matched = IPFS_GATEWAYS_LIST.findIndex((g) => assetIconUri.startsWith(g));
+      // If it matched a known gateway, or contains '/ipfs/' path, try alternatives
+      if (matched >= 0 || assetIconUri.includes('/ipfs/')) {
+        const originalHash = assetIconUri.includes('/ipfs/')
+          ? assetIconUri.split('/ipfs/').pop() ?? ''
+          : assetIconUri;
+        const currentTry = Number(img?.dataset?.gatewayTryIndex ?? 0);
+        const nextTry = currentTry + 1;
+        if (nextTry < IPFS_GATEWAYS_LIST.length) {
+          const nextSrc = `${IPFS_GATEWAYS_LIST[nextTry]}${originalHash}`;
+          if (img) {
+            img.dataset.gatewayTryIndex = String(nextTry);
+            img.src = nextSrc;
+            return; // don't mark as failed yet
+          }
+        }
+      }
+    }
+  } catch {
+    // fallthrough to marking failed
+  }
+
+  // final failure path: mark failed and optionally set a fallback icon
   failedAssetIcons.value = {
     ...failedAssetIcons.value,
     [assetKey]: true,
@@ -1013,6 +1238,9 @@ function onAssetIconError(assetKey: string, assetIconUri?: string) {
       ...failedIconUris.value,
       [assetIconUri]: true,
     };
+  }
+  if (img) {
+    img.src = BCH_ICON_URI;
   }
 }
 
@@ -1088,6 +1316,11 @@ function formatBchFromSats(sats: bigint): string {
   return bch.toLocaleString(undefined, { maximumFractionDigits: 8 });
 }
 
+function formatCurrency(value: number | null): string {
+  if (value === null || Number.isNaN(value)) return '--';
+  return value.toLocaleString(undefined, { style: 'currency', currency: fiatCurrency.value, maximumFractionDigits: 2 });
+}
+
 function formatUsd(value: number | null): string {
   if (value === null || Number.isNaN(value)) return 'Not available';
   return value.toLocaleString(undefined, { style: 'currency', currency: 'USD', maximumFractionDigits: 2 });
@@ -1121,6 +1354,27 @@ function loadPersistedClientCaches() {
     }
   } catch {
     usdRateCache.value = null;
+  }
+
+  try {
+    const rawFiatRateCache = localStorage.getItem(FIAT_RATE_CACHE_STORAGE_KEY);
+    if (rawFiatRateCache) {
+      const parsed = JSON.parse(rawFiatRateCache) as FiatRateCache;
+      if (parsed && typeof parsed === 'object' && typeof parsed.updatedAt === 'number') {
+        fiatRateCache.value = parsed;
+      }
+    }
+  } catch {
+    fiatRateCache.value = null;
+  }
+
+  try {
+    const rawFiatCurrency = localStorage.getItem(FIAT_CURRENCY_STORAGE_KEY);
+    if (rawFiatCurrency && SUPPORTED_FIAT_CURRENCIES.includes(rawFiatCurrency)) {
+      fiatCurrency.value = rawFiatCurrency;
+    }
+  } catch {
+    fiatCurrency.value = DEFAULT_FIAT_CURRENCY;
   }
 
   try {
@@ -1792,6 +2046,71 @@ async function createOrImportWallet() {
   }
 }
 
+async function applyScannedDerivationPath(result: DerivationScanResult) {
+  const inferred = inferDerivationSelection(result.parent);
+  derivationUpdateType.value = inferred.type;
+  customDerivationPathUpdate.value = inferred.customPath;
+  derivationPathType.value = inferred.type;
+  customDerivationPath.value = inferred.customPath;
+  importWalletType.value = 'hd';
+  derivationScanMessage.value = `Selected ${result.label}. HD wallet import is enabled to recover full BCH balance across the address chain.`;
+}
+
+async function scanImportDerivationPaths() {
+  derivationScanResults.value = [];
+  derivationScanMessage.value = '';
+
+  const seed = importSeed.value.trim().replace(/\s+/g, ' ');
+  if (!seed) {
+    derivationScanMessage.value = 'Seed phrase is required to scan paths.';
+    return;
+  }
+
+  isScanningDerivations.value = true;
+  derivationScanMessage.value = 'Scanning common BIP44 derivation paths...';
+  try {
+    for (const candidate of DERIVATION_SCAN_CANDIDATES) {
+      const scanResult: DerivationScanResult = {
+        label: candidate.label,
+        parent: candidate.parent,
+        full: candidate.full,
+        address: '',
+        balanceSats: 0n,
+        tokenSummary: '',
+      };
+      try {
+        const wallet = await HDWallet.fromSeed(seed, candidate.parent, 0, 0);
+        const address = wallet.getDepositAddress(0);
+        const utxos = await wallet.getUtxos();
+        const bchBalance = utxos.filter((u) => u.token === undefined).reduce((sum, u) => sum + u.satoshis, 0n);
+        const tokenCounts = utxos
+          .filter((u) => u.token?.category)
+          .reduce((acc, utxo) => {
+            const category = utxo.token?.category ?? '';
+            acc[category] = (acc[category] ?? 0n) + (utxo.token?.amount ?? 0n);
+            return acc;
+          }, {} as Record<string, bigint>);
+        const tokenSummary = Object.entries(tokenCounts)
+          .map(([category, amount]) => `${category}: ${amount.toString()}`)
+          .join(', ');
+
+        scanResult.address = address;
+        scanResult.balanceSats = bchBalance;
+        scanResult.tokenSummary = tokenSummary;
+        await wallet.stop();
+      } catch (error) {
+        scanResult.error = error instanceof Error ? error.message : String(error);
+      }
+      derivationScanResults.value.push(scanResult);
+    }
+    derivationScanMessage.value = 'Scan complete.';
+  } catch (error) {
+    derivationScanMessage.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    isScanningDerivations.value = false;
+  }
+}
+
 async function refreshBalancesAndTokens() {
   if (!activeWallet.value) return;
   const shouldEmitReceiveNotifications = hasNotificationBalanceBaseline.value;
@@ -1812,9 +2131,12 @@ async function refreshBalancesAndTokens() {
     bchUsdRate.value = oneBchInUsd;
     const balanceBch = Number(bchBalance.value) / 100_000_000;
     usdBalance.value = balanceBch * oneBchInUsd;
+    await updateFiatRate();
+    fiatBalance.value = usdBalance.value !== null ? usdBalance.value * usdToFiatRate.value : null;
   } catch {
     bchUsdRate.value = null;
     usdBalance.value = null;
+    fiatBalance.value = null;
   }
 
   const tokenMap = new Map<string, TokenSummary>();
@@ -2207,6 +2529,16 @@ watch([tokenListCollapsed, isMobileView, tokenList], ([collapsed, isMobile, list
   void hydrateTokenNames(list);
 });
 
+watch([fiatCurrency, usdBalance], async ([currency, usd]) => {
+  if (usd === null) {
+    fiatBalance.value = null;
+    return;
+  }
+
+  await updateFiatRate();
+  fiatBalance.value = usd * usdToFiatRate.value;
+});
+
 watch(notificationEvents, () => {
   persistNotificationEvents();
 }, { deep: true });
@@ -2237,6 +2569,8 @@ onBeforeUnmount(() => {
         </button>
       </div>
     </div>
+
+    
 
     <div class="home-stack">
       <section class="glass-card active-wallet-card">
@@ -2287,6 +2621,18 @@ onBeforeUnmount(() => {
               @update:modelValue="onDerivationUpdateTypeChangeAndApply"
             />
           </div>
+          <!--
+          <div class="row fiat-currency-row">
+            <label for="fiat-currency-select">Fiat currency</label>
+            <UiSelect
+              id="fiat-currency-select"
+              class="currency-select"
+              :model-value="fiatCurrency"
+              :options="currencyOptions"
+              @update:modelValue="onFiatCurrencyChange"
+            />
+          </div>
+          -->
           <div class="row active-derivation-custom-row" v-if="derivationUpdateType === 'custom'">
             <label for="active-custom-derivation-input">Custom Path</label>
             <input
@@ -2304,9 +2650,15 @@ onBeforeUnmount(() => {
 
       <section class="glass-card tokens-preview-card">
         <div class="tokens-preview-head">
-          <h3><FontAwesomeIcon :icon="['fas', 'coins']" class="icon-title" />Tokens</h3>
-          <span class="tokens-preview-usd">{{ formatUsd(usdBalance) }}</span>
-          <button class="tiny-btn" @click="openTokenListModal" :disabled="assetItems.length === 0">View all</button>
+          <div class="tokens-preview-head-left">
+            <h3><FontAwesomeIcon :icon="['fas', 'coins']" class="icon-title" />Tokens</h3>
+          </div>
+          <div class="tokens-preview-head-right">
+            <span class="tokens-preview-usd">{{ formatCurrency(fiatBalance) }}</span>
+            <!--
+            <button class="tiny-btn" @click="openTokenListModal" :disabled="assetItems.length === 0">View all</button>
+            -->
+          </div>
         </div>
         <div v-if="assetItems.length === 0" class="hint">No assets found.</div>
         <div class="token-cards" v-else>
@@ -2327,7 +2679,7 @@ onBeforeUnmount(() => {
                 loading="lazy"
                 decoding="async"
                 referrerpolicy="no-referrer"
-                @error="onAssetIconError(asset.key, asset.iconUri)"
+                @error="onAssetIconError($event, asset.key, asset.iconUri)"
               />
               <FontAwesomeIcon v-else :icon="['fas', 'coins']" />
             </button>
@@ -2340,7 +2692,7 @@ onBeforeUnmount(() => {
                 loading="lazy"
                 decoding="async"
                 referrerpolicy="no-referrer"
-                @error="onAssetIconError(asset.key, asset.iconUri)"
+                @error="onAssetIconError($event, asset.key, asset.iconUri)"
               />
               <FontAwesomeIcon v-else :icon="['fas', 'coins']" />
             </div>
@@ -2423,60 +2775,12 @@ onBeforeUnmount(() => {
             @click="toggleNotificationMenu"
             :title="notificationCount > 0 ? `${notificationCount} unread notifications` : 'No unread notifications'"
             :aria-label="notificationCount > 0 ? `${notificationCount} unread notifications` : 'No unread notifications'"
-            :aria-expanded="notificationMenuOpen"
             aria-haspopup="menu"
           >
             <FontAwesomeIcon :icon="['fas', 'bell']" class="status-pill-icon" />
             <span v-if="notificationCount > 0" class="status-pill-badge" aria-hidden="true">{{ notificationCount }}</span>
           </button>
-          <div v-if="notificationMenuOpen" class="notification-menu" role="menu" aria-label="Notifications list">
-            <div class="notification-menu-head">
-              <strong>Notifications</strong>
-              <button
-                v-if="notificationCount > 0"
-                class="notification-mark-read-btn"
-                @click="markAllNotificationsRead"
-                type="button"
-              >
-                Mark all as read
-              </button>
-            </div>
-            <div v-if="notificationItems.length === 0" class="notification-empty">
-              {{ hasEnabledNotificationTypes ? 'No new notifications.' : 'All notification types are turned off.' }}
-            </div>
-            <button
-              v-for="item in notificationItems"
-              :key="item.id"
-              class="notification-item"
-              :class="{ 'is-unread': !item.read }"
-              role="menuitem"
-              @click="handleNotificationClick(item)"
-            >
-              <span class="notification-item-avatar" aria-hidden="true">
-                <FontAwesomeIcon :icon="['fas', item.icon]" class="notification-item-icon" />
-              </span>
-              <span class="notification-item-content">
-                <span class="notification-item-message">{{ item.message }}</span>
-                <span class="notification-item-meta">
-                  <span class="notification-item-label">{{ item.label }}</span>
-                  <span class="notification-item-time">{{ formatNotificationTime(item.createdAt) }}</span>
-                </span>
-              </span>
-              <span class="notification-unread-dot" aria-hidden="true"></span>
-            </button>
-          </div>
         </div>
-        <button
-          class="status-pill"
-          role="listitem"
-          type="button"
-          :class="{ 'status-pill-live': mobileCompactMode }"
-          @click="toggleMobileCompactMode"
-          :title="mobileCompactMode ? 'Turn compact mode off' : 'Turn compact mode on'"
-          :aria-label="mobileCompactMode ? 'Turn compact mode off' : 'Turn compact mode on'"
-        >
-          <FontAwesomeIcon :icon="['fas', 'sliders']" class="status-pill-icon" />
-        </button>
       </div>
     </footer>
 
@@ -2570,6 +2874,113 @@ onBeforeUnmount(() => {
       </dialog>
     </div>
 
+    <div v-if="activeOverlayScreen === 'notifications'" class="action-sheet-overlay" @click.self="closeNotificationMenu">
+      <dialog class="action-sheet notifications-modal" open aria-label="Notifications">
+        <div class="action-sheet-header">
+          <div class="action-sheet-title-wrap">
+            <strong class="action-sheet-title">Notifications</strong>
+            <span class="action-sheet-subtitle">Recent alerts and settings</span>
+          </div>
+          <button class="icon-close" @click="closeNotificationMenu" aria-label="Close notifications">
+            <FontAwesomeIcon :icon="['fas', 'xmark']" />
+          </button>
+        </div>
+
+        <section class="manage-wallet-info">
+          <div class="wallet-notifications-tabs">
+            <button :class="{ active: notificationPanelView === 'list' }" @click="setNotificationPanelView('list')" type="button">List</button>
+            <button :class="{ active: notificationPanelView === 'settings' }" @click="setNotificationPanelView('settings')" type="button">Settings</button>
+          </div>
+          <div class="wallet-notifications-head-actions">
+            <button
+              v-if="notificationCount > 0 && notificationPanelView === 'list'"
+              class="notification-mark-read-btn"
+              @click="markAllNotificationsRead"
+              type="button"
+            >
+              Mark all as read
+            </button>
+          </div>
+
+          <div v-if="notificationPanelView === 'list'">
+            <div class="notification-list-controls">
+              <div class="notification-filter">
+                <button :class="{ active: notificationListFilter === 'unread' }" @click="notificationListFilter = 'unread'">Unread</button>
+                <button :class="{ active: notificationListFilter === 'all' }" @click="notificationListFilter = 'all'">All</button>
+              </div>
+              <div class="notification-pagination-info">
+                <span>Page {{ notificationPage }} / {{ notificationTotalPages }}</span>
+              </div>
+            </div>
+
+            <div v-if="filteredNotificationEvents.length === 0" class="notification-empty">
+              {{ hasEnabledNotificationTypes ? 'No notifications.' : 'All notification types are turned off.' }}
+            </div>
+
+            <div v-else class="wallet-notification-list">
+              <button
+                v-for="item in displayedNotifications"
+                :key="item.id"
+                class="wallet-notification-item"
+                :class="{ 'is-unread': !item.read }"
+                @click="handleNotificationClick(item)"
+                type="button"
+              >
+                <span class="notification-item-avatar" aria-hidden="true">
+                  <FontAwesomeIcon :icon="['fas', item.icon]" class="notification-item-icon" />
+                </span>
+                <span class="notification-item-content">
+                  <span class="notification-item-message">{{ item.message }}</span>
+                  <span class="notification-item-meta">
+                    <span class="notification-item-label">{{ item.label }}</span>
+                    <span class="notification-item-time">{{ formatNotificationTime(item.createdAt) }}</span>
+                  </span>
+                </span>
+                <span class="notification-unread-dot" aria-hidden="true"></span>
+              </button>
+            </div>
+
+            <div class="wallet-notification-pagination">
+              <button class="tiny-btn" :disabled="notificationPage <= 1" @click="notificationPage = Math.max(1, notificationPage - 1)">Prev</button>
+              <button class="tiny-btn" :disabled="notificationPage >= notificationTotalPages" @click="notificationPage = Math.min(notificationTotalPages, notificationPage + 1)">Next</button>
+              <span class="hint">Showing {{ displayedNotifications.length }} of {{ filteredNotificationEvents.length }} notifications</span>
+            </div>
+
+            <div class="wallet-notification-footer">
+              <button class="tiny-btn" @click="setWalletModalView('wallets')">Back to wallets</button>
+              <button class="tiny-btn" @click="toggleNotificationMenu">Open quick list</button>
+            </div>
+          </div>
+
+          <div v-if="notificationPanelView === 'settings'" class="wallet-notification-settings wallet-notification-settings-panel" aria-label="Notification settings">
+            <div class="wallet-notification-settings-head">
+              <strong>Notification Settings</strong>
+              <span class="hint">Control what appears in the bell list</span>
+            </div>
+            <div class="wallet-notification-setting" v-for="item in allNotificationItems" :key="`notif-setting-${item.id}`">
+              <span class="wallet-notification-setting-label">
+                <FontAwesomeIcon :icon="['fas', item.icon]" class="notification-item-icon" />
+                {{ item.label }}
+              </span>
+              <label class="toggle-switch" :for="`notif-toggle-${item.id}`">
+                <input
+                  class="toggle-switch-input"
+                  type="checkbox"
+                  :id="`notif-toggle-${item.id}`"
+                  :checked="notificationSettings[item.settingKey]"
+                  @change="onNotificationSettingToggle(item.settingKey, $event)"
+                />
+                <span class="toggle-switch-slider" aria-hidden="true"></span>
+              </label>
+            </div>
+            <div class="wallet-notification-footer">
+              <button class="tiny-btn" @click="setNotificationPanelView('list')">Back to list</button>
+            </div>
+          </div>
+        </section>
+      </dialog>
+    </div>
+
     <div v-if="activeOverlayScreen === 'token-list'" class="action-sheet-overlay" @click.self="closeTokenListModal">
       <dialog class="action-sheet token-list-modal" open aria-label="All tokens">
         <div class="action-sheet-header">
@@ -2602,7 +3013,7 @@ onBeforeUnmount(() => {
                   loading="lazy"
                   decoding="async"
                   referrerpolicy="no-referrer"
-                  @error="onAssetIconError(asset.key, asset.iconUri)"
+                  @error="onAssetIconError($event, asset.key, asset.iconUri)"
                 />
                 <FontAwesomeIcon v-else :icon="['fas', 'coins']" />
               </button>
@@ -2615,7 +3026,7 @@ onBeforeUnmount(() => {
                   loading="lazy"
                   decoding="async"
                   referrerpolicy="no-referrer"
-                  @error="onAssetIconError(asset.key, asset.iconUri)"
+                  @error="onAssetIconError($event, asset.key, asset.iconUri)"
                 />
                 <FontAwesomeIcon v-else :icon="['fas', 'coins']" />
               </div>
@@ -2693,7 +3104,7 @@ onBeforeUnmount(() => {
                     loading="lazy"
                     decoding="async"
                     referrerpolicy="no-referrer"
-                    @error="onAssetIconError(asset.key, asset.iconUri)"
+                    @error="onAssetIconError($event, asset.key, asset.iconUri)"
                   />
                   <FontAwesomeIcon v-else :icon="['fas', 'coins']" />
                 </button>
@@ -2706,7 +3117,7 @@ onBeforeUnmount(() => {
                     loading="lazy"
                     decoding="async"
                     referrerpolicy="no-referrer"
-                    @error="onAssetIconError(asset.key, asset.iconUri)"
+                    @error="onAssetIconError($event, asset.key, asset.iconUri)"
                   />
                   <FontAwesomeIcon v-else :icon="['fas', 'coins']" />
                 </div>
@@ -3202,6 +3613,33 @@ onBeforeUnmount(() => {
           <div class="row" v-if="derivationPathType === 'custom'">
             <label for="wallet-custom-derivation-input">Custom Path</label>
             <input id="wallet-custom-derivation-input" v-model="customDerivationPath" placeholder="m/44'/145'/0' or m/44'/145'/0'/0/0" />
+          </div>
+          <div class="row">
+            <button class="action-sheet-btn" type="button" @click="scanImportDerivationPaths" :disabled="isScanningDerivations">
+              <FontAwesomeIcon :icon="['fas', 'search']" class="icon-btn" />
+              {{ isScanningDerivations ? 'Scanning paths...' : 'Scan BIP44 Derivation Paths' }}
+            </button>
+          </div>
+          <div class="row" v-if="derivationScanMessage">
+            <p class="hint">{{ derivationScanMessage }}</p>
+          </div>
+          <div class="row" v-if="derivationScanResults.length > 0">
+            <div class="scan-results">
+              <div class="scan-results-header">
+                <strong>Scan results</strong>
+              </div>
+              <div class="scan-results-list">
+                <div v-for="result in derivationScanResults" :key="result.parent" class="scan-result-item">
+                  <div class="scan-result-row">
+                    <span class="scan-label">{{ result.label }}</span>
+                    <button class="tiny-btn" type="button" @click="applyScannedDerivationPath(result)">Select</button>
+                  </div>
+                  <div class="scan-result-value"><strong>Address:</strong> {{ result.address || 'Unable to derive' }}</div>
+                  <div class="scan-result-value"><strong>BCH:</strong> {{ formatBchFromSats(result.balanceSats) }} · <strong>Tokens:</strong> {{ result.tokenSummary || 'none' }}</div>
+                  <div class="scan-result-value" v-if="result.error"><strong>Error:</strong> {{ result.error }}</div>
+                </div>
+              </div>
+            </div>
           </div>
           </template>
         </div>
