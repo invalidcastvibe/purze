@@ -184,6 +184,7 @@ const USD_RATE_CACHE_TTL_MOBILE_MS = 6 * 60 * 1000;
 const USD_FIAT_RATE_API_KEY = 'bec0eef0773f6adde5c947ba';
 const USD_FIAT_RATE_API_URL = `https://v6.exchangerate-api.com/v6/${USD_FIAT_RATE_API_KEY}/latest/USD`;
 const USD_FIAT_RATE_FALLBACK_URL = `https://api.exchangerate.host/latest?base=USD&symbols=${SUPPORTED_FIAT_CURRENCIES.join(',')}`;
+const TOKEN_EXPLORER_BASE_URL = 'https://tokenexplorer.cash/?tokenId=';
 
 const walletConnectRuntime = globalThis as typeof globalThis & {
   __purzeWalletConnectCore?: unknown;
@@ -241,6 +242,10 @@ const sendToAddress = ref('');
 const sendBchAmount = ref('');
 const sendTokenCategory = ref('');
 const sendTokenAmount = ref('');
+const sendDestinationMode = ref<'external' | 'wallet'>('external');
+const sendToWalletName = ref('');
+const isResolvingWalletAddress = ref(false);
+const sendToWalletError = ref('');
 const tokenSendHistory = ref<TokenHistoryItem[]>([]);
 const isLoadingTokenSendHistory = ref(false);
 const tokenSendHistoryError = ref('');
@@ -252,6 +257,12 @@ const isMobileView = ref(false);
 const mobileActivePanel = ref<MobilePanel>('wallet');
 const mobileCompactMode = ref(false);
 const showHiddenTokensInModal = ref(false);
+const tokenDetailOpen = ref(false);
+const tokenDetailAsset = ref<AssetItem | null>(null);
+const tokenDetailUrl = ref('');
+const tokenDetailIframeSrc = ref('');
+const tokenDetailLoading = ref(false);
+const tokenDetailError = ref('');
 const walletManagerCollapsed = ref(true);
 const activeWalletSectionEl = ref<HTMLElement | null>(null);
 const tokensSectionEl = ref<HTMLElement | null>(null);
@@ -314,6 +325,14 @@ Config.DefaultParentDerivationPath = DERIVATION_PATHS.standard.parent;
 const walletNames = computed(() => wallets.value.map((w) => w.name));
 const resolvedDerivation = computed(() => resolveDerivationPaths(derivationPathType.value, customDerivationPath.value));
 const activeWalletOptions = computed<SelectOption[]>(() => wallets.value.map((w) => ({ value: w.name, label: `${w.name} (${w.type})` })));
+const otherWalletOptions = computed<SelectOption[]>(() =>
+  wallets.value.filter((w) => w.name !== activeWalletName.value).map((w) => ({ value: w.name, label: `${w.name} (${w.type})` }))
+);
+const hasOtherWallets = computed(() => otherWalletOptions.value.length > 0);
+const sendDestinationModeOptions: SelectOption[] = [
+  { value: 'external', label: 'External Address' },
+  { value: 'wallet', label: 'One of My Wallets' },
+];
 const sendModeOptions: SelectOption[] = [
   { value: 'bch', label: 'Send BCH' },
   { value: 'token', label: 'Send CashToken' },
@@ -691,6 +710,7 @@ function closeTokenListModal() {
     activeOverlayScreen.value = 'none';
     showHiddenTokensInModal.value = false;
   }
+  closeTokenDetail();
 }
 
 function openWalletConnectModal() {
@@ -709,6 +729,9 @@ function openSendAssetModalForBch() {
   sendToAddress.value = '';
   sendBchAmount.value = '';
   sendTokenAmount.value = '';
+  sendDestinationMode.value = 'external';
+  sendToWalletName.value = '';
+  sendToWalletError.value = '';
   tokenSendHistoryError.value = '';
   activeOverlayScreen.value = 'send-asset';
   void loadTokenSendHistory();
@@ -720,6 +743,9 @@ function openSendAssetModalForToken(category: string) {
   sendToAddress.value = '';
   sendBchAmount.value = '';
   sendTokenAmount.value = '';
+  sendDestinationMode.value = 'external';
+  sendToWalletName.value = '';
+  sendToWalletError.value = '';
   tokenSendHistoryError.value = '';
   activeOverlayScreen.value = 'send-asset';
   void loadTokenSendHistory();
@@ -831,6 +857,9 @@ function resetSendForm() {
   sendToAddress.value = '';
   sendBchAmount.value = '';
   sendTokenAmount.value = '';
+  sendDestinationMode.value = 'external';
+  sendToWalletName.value = '';
+  sendToWalletError.value = '';
 }
 
 function formatHistoryTxHash(hash: string): string {
@@ -891,6 +920,50 @@ async function loadTokenSendHistory() {
   }
 }
 
+function onSendDestinationModeChange(value: string) {
+  sendDestinationMode.value = value === 'wallet' ? 'wallet' : 'external';
+  sendToWalletError.value = '';
+  if (sendDestinationMode.value === 'external') {
+    sendToWalletName.value = '';
+    sendToAddress.value = '';
+  } else if (!sendToWalletName.value && otherWalletOptions.value.length > 0) {
+    sendToWalletName.value = otherWalletOptions.value[0].value;
+  }
+}
+
+function onSendToWalletChange(value: string) {
+  sendToWalletName.value = value;
+}
+
+async function resolveSendToWalletAddress() {
+  if (sendDestinationMode.value !== 'wallet' || !sendToWalletName.value) return;
+
+  const meta = getWalletMeta(sendToWalletName.value);
+  if (!meta) {
+    sendToWalletError.value = 'Selected wallet could not be found';
+    sendToAddress.value = '';
+    return;
+  }
+
+  isResolvingWalletAddress.value = true;
+  sendToWalletError.value = '';
+  try {
+    const wallet = meta.type === 'hd' ? await HDWallet.named(meta.name) : await Wallet.named(meta.name);
+    sendToAddress.value = sendMode.value === 'token' ? wallet.getTokenDepositAddress() : wallet.getDepositAddress();
+  } catch (error) {
+    sendToAddress.value = '';
+    sendToWalletError.value = error instanceof Error ? error.message : 'Failed to load wallet address';
+  } finally {
+    isResolvingWalletAddress.value = false;
+  }
+}
+
+watch([sendToWalletName, sendMode, sendDestinationMode], () => {
+  if (sendDestinationMode.value === 'wallet') {
+    void resolveSendToWalletAddress();
+  }
+});
+
 async function sendBch() {
   if (!activeWallet.value) {
     status.value = 'No active wallet selected';
@@ -911,8 +984,9 @@ async function sendBch() {
   isSendingFunds.value = true;
   try {
     const { txId } = await activeWallet.value.send([{ cashaddr, value: sats }]);
-    status.value = txId ? `BCH sent. TxId: ${txId}` : 'BCH sent';
-    pushNotification('sendFunds', `You sent ${formatBchFromSats(sats)} BCH.`);
+    const destinationSuffix = sendDestinationMode.value === 'wallet' && sendToWalletName.value ? ` to ${sendToWalletName.value}` : '';
+    status.value = txId ? `BCH sent${destinationSuffix}. TxId: ${txId}` : `BCH sent${destinationSuffix}`;
+    pushNotification('sendFunds', `You sent ${formatBchFromSats(sats)} BCH${destinationSuffix}.`);
     resetSendForm();
     closeSendAssetModal();
     await refreshBalancesAndTokens();
@@ -960,8 +1034,9 @@ async function sendCashToken() {
         amount,
       }),
     ]);
-    status.value = txId ? `CashToken sent. TxId: ${txId}` : 'CashToken sent';
-    pushNotification('sendFunds', `You sent ${formatTokenAmount(amount, selectedToken.decimals)} ${selectedToken.symbol ?? selectedToken.displayName}.`);
+    const destinationSuffix = sendDestinationMode.value === 'wallet' && sendToWalletName.value ? ` to ${sendToWalletName.value}` : '';
+    status.value = txId ? `CashToken sent${destinationSuffix}. TxId: ${txId}` : `CashToken sent${destinationSuffix}`;
+    pushNotification('sendFunds', `You sent ${formatTokenAmount(amount, selectedToken.decimals)} ${selectedToken.symbol ?? selectedToken.displayName}${destinationSuffix}.`);
     resetSendForm();
     closeSendAssetModal();
     await refreshBalancesAndTokens();
@@ -974,6 +1049,10 @@ async function sendCashToken() {
 
 async function sendFunds() {
   if (isSendingFunds.value) return;
+  if (sendDestinationMode.value === 'wallet' && !sendToWalletName.value) {
+    status.value = 'Select a destination wallet';
+    return;
+  }
   if (sendMode.value === 'token') {
     await sendCashToken();
     return;
@@ -1162,6 +1241,37 @@ async function copyTokenId(category: string) {
   } catch {
     status.value = 'Failed to copy token ID';
   }
+}
+
+async function openTokenDetail(asset: AssetItem) {
+  if (asset.kind !== 'token' || !asset.category) return;
+
+  tokenDetailAsset.value = asset;
+  tokenDetailUrl.value = `${TOKEN_EXPLORER_BASE_URL}${asset.category}`;
+  tokenDetailIframeSrc.value = '';
+  tokenDetailError.value = '';
+  tokenDetailLoading.value = true;
+  tokenDetailOpen.value = true;
+
+  try {
+    // Best-effort fetch to confirm the detail page is reachable before loading it.
+    await fetch(tokenDetailUrl.value, { mode: 'no-cors' });
+  } catch {
+    // tokenexplorer.cash may not expose CORS headers for a plain fetch; that's
+    // fine, the iframe below loads the page directly as a normal navigation.
+  } finally {
+    tokenDetailIframeSrc.value = tokenDetailUrl.value;
+    tokenDetailLoading.value = false;
+  }
+}
+
+function closeTokenDetail() {
+  tokenDetailOpen.value = false;
+  tokenDetailAsset.value = null;
+  tokenDetailUrl.value = '';
+  tokenDetailIframeSrc.value = '';
+  tokenDetailError.value = '';
+  tokenDetailLoading.value = false;
 }
 
 function formatTokenAmount(amount: bigint, decimals: number): string {
@@ -2655,9 +2765,7 @@ onBeforeUnmount(() => {
           </div>
           <div class="tokens-preview-head-right">
             <span class="tokens-preview-usd">{{ formatCurrency(fiatBalance) }}</span>
-            <!--
             <button class="tiny-btn" @click="openTokenListModal" :disabled="assetItems.length === 0">View all</button>
-            -->
           </div>
         </div>
         <div v-if="assetItems.length === 0" class="hint">No assets found.</div>
@@ -3036,7 +3144,19 @@ onBeforeUnmount(() => {
                     <span v-if="asset.kind === 'token' && asset.category && isTokenCategoryFavorite(asset.category)" class="token-favorite-badge" title="Favorite token" aria-label="Favorite token">
                       <FontAwesomeIcon :icon="['fas', 'star']" />
                     </span>
-                    {{ asset.displayName }}<span v-if="asset.symbol"> ({{ asset.symbol }})</span>
+                    <button
+                      v-if="asset.kind === 'token' && asset.category"
+                      type="button"
+                      class="token-name-link"
+                      @click="openTokenDetail(asset)"
+                      :aria-label="`View details for ${asset.displayName}`"
+                      :title="`View details for ${asset.displayName}`"
+                    >
+                      {{ asset.displayName }}<span v-if="asset.symbol"> ({{ asset.symbol }})</span>
+                    </button>
+                    <template v-else>
+                      {{ asset.displayName }}<span v-if="asset.symbol"> ({{ asset.symbol }})</span>
+                    </template>
                   </div>
                   <strong class="token-usd-value">{{ asset.usdValueText }}</strong>
                 </div>
@@ -3127,7 +3247,19 @@ onBeforeUnmount(() => {
                       <span v-if="asset.kind === 'token' && asset.category && isTokenCategoryFavorite(asset.category)" class="token-favorite-badge" title="Favorite token" aria-label="Favorite token">
                         <FontAwesomeIcon :icon="['fas', 'star']" />
                       </span>
-                      {{ asset.displayName }}<span v-if="asset.symbol"> ({{ asset.symbol }})</span>
+                      <button
+                        v-if="asset.kind === 'token' && asset.category"
+                        type="button"
+                        class="token-name-link"
+                        @click="openTokenDetail(asset)"
+                        :aria-label="`View details for ${asset.displayName}`"
+                        :title="`View details for ${asset.displayName}`"
+                      >
+                        {{ asset.displayName }}<span v-if="asset.symbol"> ({{ asset.symbol }})</span>
+                      </button>
+                      <template v-else>
+                        {{ asset.displayName }}<span v-if="asset.symbol"> ({{ asset.symbol }})</span>
+                      </template>
                     </div>
                     <strong class="token-usd-value">{{ asset.usdValueText }}</strong>
                   </div>
@@ -3164,6 +3296,37 @@ onBeforeUnmount(() => {
       </dialog>
     </div>
 
+    <div v-if="tokenDetailOpen" class="action-sheet-overlay token-detail-overlay" @click.self="closeTokenDetail">
+      <dialog class="action-sheet token-detail-modal" open aria-label="Token detail">
+        <div class="action-sheet-header">
+          <div class="action-sheet-title-wrap">
+            <strong class="action-sheet-title">{{ tokenDetailAsset?.displayName || 'Token Detail' }}</strong>
+            <span class="action-sheet-subtitle">From tokenexplorer.cash</span>
+          </div>
+          <button class="icon-close" @click="closeTokenDetail" aria-label="Close token detail">
+            <FontAwesomeIcon :icon="['fas', 'xmark']" />
+          </button>
+        </div>
+
+        <div class="token-detail-body">
+          <p class="hint" v-if="tokenDetailLoading">Loading token detail...</p>
+          <p class="hint" v-else-if="tokenDetailError">{{ tokenDetailError }}</p>
+          <iframe
+            v-if="tokenDetailIframeSrc"
+            :src="tokenDetailIframeSrc"
+            class="token-detail-iframe"
+            title="Token explorer detail"
+            referrerpolicy="no-referrer"
+            sandbox="allow-scripts allow-same-origin allow-popups"
+          ></iframe>
+          <p class="hint token-detail-link-hint" v-if="tokenDetailUrl">
+            If the detail doesn't load,
+            <a :href="tokenDetailUrl" target="_blank" rel="noopener noreferrer">open it in a new tab</a>.
+          </p>
+        </div>
+      </dialog>
+    </div>
+
     <div v-if="activeOverlayScreen === 'send-asset'" class="action-sheet-overlay" @click.self="closeSendAssetModal">
       <dialog class="action-sheet send-asset-modal" :class="{ 'send-asset-modal-token': sendMode === 'token' || sendMode === 'bch' }" open aria-label="Send asset">
         <div class="action-sheet-header">
@@ -3177,7 +3340,32 @@ onBeforeUnmount(() => {
         </div>
 
         <div class="manage-wallet-info">
-          <div class="row">
+          <div class="row" v-if="hasOtherWallets">
+            <label for="send-modal-destination-mode-select">Send To</label>
+            <UiSelect
+              class="compact-select"
+              id="send-modal-destination-mode-select"
+              :model-value="sendDestinationMode"
+              :options="sendDestinationModeOptions"
+              @update:modelValue="onSendDestinationModeChange"
+            />
+          </div>
+
+          <div class="row" v-if="sendDestinationMode === 'wallet' && hasOtherWallets">
+            <label for="send-modal-to-wallet-select">Destination Wallet</label>
+            <UiSelect
+              class="compact-select"
+              id="send-modal-to-wallet-select"
+              :model-value="sendToWalletName"
+              :options="otherWalletOptions"
+              @update:modelValue="onSendToWalletChange"
+            />
+            <p class="hint" v-if="isResolvingWalletAddress">Looking up wallet address...</p>
+            <p class="hint" v-else-if="sendToWalletError">{{ sendToWalletError }}</p>
+            <p class="hint" v-else-if="sendToAddress">Sending to: {{ sendToAddress }}</p>
+          </div>
+
+          <div class="row" v-if="sendDestinationMode === 'external'">
             <label for="send-modal-to-address-input">{{ sendMode === 'token' ? 'To Token Address' : 'To BCH Address' }}</label>
             <input
               id="send-modal-to-address-input"
@@ -3196,7 +3384,7 @@ onBeforeUnmount(() => {
             <input id="send-modal-token-amount-input" v-model="sendTokenAmount" :placeholder="selectedSendToken?.decimals ? '1.0' : '1'" />
           </div>
 
-          <button @click="sendFunds" :disabled="isSendingFunds || (sendMode === 'token' && sendableTokens.length === 0)">
+          <button @click="sendFunds" :disabled="isSendingFunds || (sendMode === 'token' && sendableTokens.length === 0) || (sendDestinationMode === 'wallet' && (isResolvingWalletAddress || !sendToAddress || !!sendToWalletError))">
             <FontAwesomeIcon :icon="['fas', isSendingFunds ? 'rotate' : 'paper-plane']" class="icon-btn" />
             {{ isSendingFunds ? 'Sending...' : (sendMode === 'token' ? 'Send CashToken' : 'Send BCH') }}
           </button>
