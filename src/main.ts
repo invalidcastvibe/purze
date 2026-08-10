@@ -25,6 +25,7 @@ import {
 	faEyeSlash,
 	faBell,
 	faUser,
+	faMagnifyingGlass,
 } from '@fortawesome/free-solid-svg-icons';
 
 library.add(
@@ -50,6 +51,7 @@ library.add(
 	faEyeSlash,
 	faBell,
 	faUser,
+	faMagnifyingGlass,
 );
 
 const app = createApp(App);

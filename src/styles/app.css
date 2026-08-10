@@ -679,6 +679,64 @@
   border-radius: 12px;
   background: rgba(15, 23, 42, 0.24);
 }
+.scan-result-item.has-funds {
+  border-color: rgba(52, 211, 153, 0.45);
+  background: rgba(16, 185, 129, 0.12);
+}
+.derivation-scan-section {
+  display: grid;
+  gap: 8px;
+  margin-top: 6px;
+  padding-top: 10px;
+  border-top: 1px dashed rgba(148, 163, 184, 0.22);
+}
+.derivation-scan-row {
+  display: grid;
+  gap: 6px;
+}
+.scan-results-details {
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 12px;
+  padding: 8px 10px;
+  background: rgba(15, 23, 42, 0.16);
+  max-height: none;
+}
+.scan-results-details[open] .scan-results-list {
+  margin-top: 10px;
+}
+.scan-results-details .scan-results-list {
+  max-height: 320px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+.scan-results-summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+.scan-results-summary::-webkit-details-marker {
+  display: none;
+}
+.scan-results-summary::after {
+  content: '\25BE';
+  margin-left: auto;
+  opacity: 0.7;
+  transition: transform 0.15s ease;
+}
+.scan-results-details[open] .scan-results-summary::after {
+  transform: rotate(180deg);
+}
+.scan-results-count {
+  margin-left: auto;
+  font-weight: 400;
+  font-size: 0.78rem;
+  color: #cbd5e1;
+  white-space: nowrap;
+}
 .token-list-modal .token-cards {
   max-height: min(62vh, 520px);
   overflow-y: auto;

@@ -213,6 +213,9 @@ const derivationScanMessage = ref('');
 const derivationUpdateType = ref<DerivationPathType>('standard');
 const customDerivationPathUpdate = ref('');
 const isUpdatingDerivation = ref(false);
+const activeWalletScanResults = ref<DerivationScanResult[]>([]);
+const isScanningActiveWalletDerivations = ref(false);
+const activeWalletScanMessage = ref('');
 const actionSheetWalletName = ref<string | null>(null);
 const manageWalletDetails = ref<ManageWalletDetails | null>(null);
 const loadingManageWalletDetails = ref(false);
@@ -366,6 +369,9 @@ const activeSeedPhrase = computed(() => {
   const w = activeWallet.value as (ActiveWallet & { mnemonic?: string }) | null;
   return w?.mnemonic ?? null;
 });
+const activeWalletScanFundedCount = computed(
+  () => activeWalletScanResults.value.filter((r) => r.balanceSats > 0n || !!r.tokenSummary).length,
+);
 
 const currencyOptions = computed<SelectOption[]>(() =>
   SUPPORTED_FIAT_CURRENCIES.map((currency) => ({ value: currency, label: currency })),
@@ -2221,6 +2227,71 @@ async function scanImportDerivationPaths() {
   }
 }
 
+async function scanActiveWalletDerivationPaths() {
+  activeWalletScanResults.value = [];
+  activeWalletScanMessage.value = '';
+
+  const seed = activeSeedPhrase.value?.trim().replace(/\s+/g, ' ');
+  if (!seed) {
+    activeWalletScanMessage.value = 'Seed phrase unavailable for this wallet; scanning requires an HD/seed-based wallet.';
+    return;
+  }
+
+  isScanningActiveWalletDerivations.value = true;
+  activeWalletScanMessage.value = 'Scanning common BIP44 derivation paths for missing funds...';
+  try {
+    for (const candidate of DERIVATION_SCAN_CANDIDATES) {
+      const scanResult: DerivationScanResult = {
+        label: candidate.label,
+        parent: candidate.parent,
+        full: candidate.full,
+        address: '',
+        balanceSats: 0n,
+        tokenSummary: '',
+      };
+      try {
+        const wallet = await HDWallet.fromSeed(seed, candidate.parent, 0, 0);
+        const address = wallet.getDepositAddress(0);
+        const utxos = await wallet.getUtxos();
+        const bchBalance = utxos.filter((u) => u.token === undefined).reduce((sum, u) => sum + u.satoshis, 0n);
+        const tokenCounts = utxos
+          .filter((u) => u.token?.category)
+          .reduce((acc, utxo) => {
+            const category = utxo.token?.category ?? '';
+            acc[category] = (acc[category] ?? 0n) + (utxo.token?.amount ?? 0n);
+            return acc;
+          }, {} as Record<string, bigint>);
+        const tokenSummary = Object.entries(tokenCounts)
+          .map(([category, amount]) => `${category}: ${amount.toString()}`)
+          .join(', ');
+
+        scanResult.address = address;
+        scanResult.balanceSats = bchBalance;
+        scanResult.tokenSummary = tokenSummary;
+        await wallet.stop();
+      } catch (error) {
+        scanResult.error = error instanceof Error ? error.message : String(error);
+      }
+      activeWalletScanResults.value.push(scanResult);
+    }
+    activeWalletScanMessage.value = activeWalletScanFundedCount.value > 0
+      ? `Scan complete. Found funds on ${activeWalletScanFundedCount.value} of ${activeWalletScanResults.value.length} paths checked.`
+      : 'Scan complete. No funds found on any of the common derivation paths checked.';
+  } catch (error) {
+    activeWalletScanMessage.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    isScanningActiveWalletDerivations.value = false;
+  }
+}
+
+async function switchActiveWalletToScannedPath(result: DerivationScanResult) {
+  if (isUpdatingDerivation.value) return;
+  const inferred = inferDerivationSelection(result.parent);
+  derivationUpdateType.value = inferred.type;
+  customDerivationPathUpdate.value = inferred.customPath;
+  await updateActiveWalletDerivationPath();
+}
+
 async function refreshBalancesAndTokens() {
   if (!activeWallet.value) return;
   const shouldEmitReceiveNotifications = hasNotificationBalanceBaseline.value;
@@ -3725,6 +3796,50 @@ onBeforeUnmount(() => {
               />
             </div>
             <p class="hint" v-if="derivationUpdateType === 'custom'">Press Enter after typing a custom path to apply and reload.</p>
+
+            <div class="derivation-scan-section" v-if="manageWalletDetails?.isActive">
+              <div class="row derivation-scan-row">
+                <button
+                  class="action-sheet-btn"
+                  type="button"
+                  @click="scanActiveWalletDerivationPaths"
+                  :disabled="isScanningActiveWalletDerivations || !activeSeedPhrase"
+                >
+                  <FontAwesomeIcon :icon="['fas', 'magnifying-glass']" class="icon-btn" />
+                  {{ isScanningActiveWalletDerivations ? 'Scanning paths...' : 'Scan for Missing Funds' }}
+                </button>
+                <p class="hint" v-if="!activeSeedPhrase">Seed phrase unavailable for this wallet; scanning requires an HD/seed-based wallet.</p>
+              </div>
+              <p class="hint" v-if="activeWalletScanMessage">{{ activeWalletScanMessage }}</p>
+
+              <details class="scan-results scan-results-details" v-if="activeWalletScanResults.length > 0" open>
+                <summary class="scan-results-summary">
+                  Scan results
+                  <span class="scan-results-count">{{ activeWalletScanFundedCount }} of {{ activeWalletScanResults.length }} paths with funds</span>
+                </summary>
+                <div class="scan-results-list">
+                  <div
+                    v-for="result in activeWalletScanResults"
+                    :key="result.parent"
+                    class="scan-result-item"
+                    :class="{ 'has-funds': result.balanceSats > 0n || !!result.tokenSummary }"
+                  >
+                    <div class="scan-result-row">
+                      <span class="scan-label">{{ result.label }}</span>
+                      <button
+                        class="tiny-btn"
+                        type="button"
+                        :disabled="isUpdatingDerivation"
+                        @click="switchActiveWalletToScannedPath(result)"
+                      >Switch here</button>
+                    </div>
+                    <div class="scan-result-value"><strong>Address:</strong> {{ result.address || 'Unable to derive' }}</div>
+                    <div class="scan-result-value"><strong>BCH:</strong> {{ formatBchFromSats(result.balanceSats) }} · <strong>Tokens:</strong> {{ result.tokenSummary || 'none' }}</div>
+                    <div class="scan-result-value" v-if="result.error"><strong>Error:</strong> {{ result.error }}</div>
+                  </div>
+                </div>
+              </details>
+            </div>
           </div>
         </template>
 
@@ -3804,7 +3919,7 @@ onBeforeUnmount(() => {
           </div>
           <div class="row">
             <button class="action-sheet-btn" type="button" @click="scanImportDerivationPaths" :disabled="isScanningDerivations">
-              <FontAwesomeIcon :icon="['fas', 'search']" class="icon-btn" />
+              <FontAwesomeIcon :icon="['fas', 'magnifying-glass']" class="icon-btn" />
               {{ isScanningDerivations ? 'Scanning paths...' : 'Scan BIP44 Derivation Paths' }}
             </button>
           </div>
