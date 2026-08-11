@@ -22,6 +22,12 @@ type ManagedWallet = {
   source?: 'created' | 'imported';
 };
 
+type WalletBalanceEntry = {
+  sats: bigint;
+  loading: boolean;
+  error?: string;
+};
+
 type ActiveWallet = Wallet | HDWallet | TestNetWallet | TestNetHDWallet;
 
 type TokenSummary = {
@@ -196,6 +202,7 @@ const toastMessage = ref('');
 const toastVisible = ref(false);
 let toastTimer: ReturnType<typeof setTimeout> | null = null;
 const wallets = ref<ManagedWallet[]>([]);
+const walletBalances = ref<Record<string, WalletBalanceEntry>>({});
 const activeWalletName = ref('');
 const activeWalletType = ref<WalletKind>('single');
 const activeWallet = ref<ActiveWallet | null>(null);
@@ -325,6 +332,12 @@ BaseWallet.StorageProvider = IndexedDBProvider;
 Config.DefaultParentDerivationPath = DERIVATION_PATHS.standard.parent;
 
 const walletNames = computed(() => wallets.value.map((w) => w.name));
+const grandTotalSats = computed(() => wallets.value.reduce((sum, w) => sum + (walletBalances.value[w.name]?.sats ?? 0n), 0n));
+const grandTotalFiat = computed(() => {
+  if (bchUsdRate.value === null) return null;
+  return (Number(grandTotalSats.value) / 100_000_000) * bchUsdRate.value * usdToFiatRate.value;
+});
+const isLoadingWalletBalances = computed(() => wallets.value.some((w) => walletBalances.value[w.name]?.loading));
 const resolvedDerivation = computed(() => resolveDerivationPaths(derivationPathType.value, customDerivationPath.value));
 const activeWalletOptions = computed<SelectOption[]>(() => wallets.value.map((w) => ({ value: w.name, label: `${w.name} (${w.type})` })));
 const otherWalletOptions = computed<SelectOption[]>(() =>
@@ -687,6 +700,7 @@ function onReceiveAddressTypeChange(value: string) {
 function openWalletListModal() {
   walletModalView.value = 'wallets';
   activeOverlayScreen.value = 'wallet-list';
+  void refreshAllWalletBalances();
 }
 
 function setWalletModalView(view: 'wallets' | 'notifications') {
@@ -1596,6 +1610,63 @@ function getWalletMeta(name: string) {
   return wallets.value.find((w) => w.name === name) ?? null;
 }
 
+function getWalletBalanceEntry(name: string): WalletBalanceEntry {
+  return walletBalances.value[name] ?? { sats: 0n, loading: false };
+}
+
+function walletFiatValue(sats: bigint): number | null {
+  if (bchUsdRate.value === null) return null;
+  return (Number(sats) / 100_000_000) * bchUsdRate.value * usdToFiatRate.value;
+}
+
+async function loadWalletBalanceEntry(walletName: string) {
+  const meta = getWalletMeta(walletName);
+  if (!meta) return;
+
+  if (walletName === activeWalletName.value && activeWallet.value) {
+    walletBalances.value = {
+      ...walletBalances.value,
+      [walletName]: { sats: bchBalance.value, loading: false },
+    };
+    return;
+  }
+
+  walletBalances.value = {
+    ...walletBalances.value,
+    [walletName]: { sats: getWalletBalanceEntry(walletName).sats, loading: true, error: undefined },
+  };
+
+  try {
+    const wallet = meta.type === 'hd' ? await HDWallet.named(walletName) : await Wallet.named(walletName);
+    const utxos = await wallet.getUtxos();
+    const sats = utxos.filter((u) => u.token === undefined).reduce((sum, u) => sum + u.satoshis, 0n);
+    walletBalances.value = {
+      ...walletBalances.value,
+      [walletName]: { sats, loading: false },
+    };
+  } catch (error) {
+    walletBalances.value = {
+      ...walletBalances.value,
+      [walletName]: {
+        sats: getWalletBalanceEntry(walletName).sats,
+        loading: false,
+        error: error instanceof Error ? error.message : 'Failed to load balance',
+      },
+    };
+  }
+}
+
+async function refreshAllWalletBalances() {
+  if (bchUsdRate.value === null) {
+    try {
+      bchUsdRate.value = await getBchUsdRateWithCache();
+    } catch {
+      // Grand total will still show BCH amounts even if the fiat rate is unavailable.
+    }
+  }
+  await Promise.all(wallets.value.map((w) => loadWalletBalanceEntry(w.name)));
+}
+
 async function onActiveWalletChange(value: string) {
   activeWalletName.value = value;
   await loadActiveWallet(value);
@@ -1919,6 +1990,8 @@ async function deleteManagedWallet() {
     ]);
 
     wallets.value = wallets.value.filter((wallet) => wallet.name !== walletName);
+    const { [walletName]: _removedBalance, ...remainingBalances } = walletBalances.value;
+    walletBalances.value = remainingBalances;
     saveWallets();
     closeWalletActionSheet();
     status.value = `Wallet ${walletName} deleted`;
@@ -2299,6 +2372,12 @@ async function refreshBalancesAndTokens() {
     .filter((u) => u.token === undefined)
     .reduce((sum, u) => sum + u.satoshis, 0n);
   bchBalance.value = nextBchBalance;
+  if (activeWalletName.value) {
+    walletBalances.value = {
+      ...walletBalances.value,
+      [activeWalletName.value]: { sats: nextBchBalance, loading: false },
+    };
+  }
 
   if (shouldEmitReceiveNotifications && previousBchBalance.value !== null && nextBchBalance > previousBchBalance.value) {
     const delta = nextBchBalance - previousBchBalance.value;
@@ -3006,6 +3085,29 @@ onBeforeUnmount(() => {
 
         <div class="manage-wallet-info wallet-list-panel">
           <div v-if="walletModalView === 'wallets' && wallets.length === 0" class="hint">No wallets yet.</div>
+
+          <div v-if="walletModalView === 'wallets' && wallets.length > 0" class="wallet-grand-total">
+            <div class="wallet-grand-total-copy">
+              <span class="wallet-grand-total-label">
+                Total across {{ wallets.length }} wallet{{ wallets.length === 1 ? '' : 's' }}
+              </span>
+              <span class="wallet-grand-total-amount">
+                {{ formatBchFromSats(grandTotalSats) }} BCH
+                <span v-if="grandTotalFiat !== null" class="wallet-grand-total-fiat">≈ {{ formatCurrency(grandTotalFiat) }}</span>
+              </span>
+            </div>
+            <button
+              class="tiny-btn wallet-grand-total-refresh"
+              type="button"
+              @click="refreshAllWalletBalances"
+              :disabled="isLoadingWalletBalances"
+              title="Refresh wallet balances"
+              aria-label="Refresh wallet balances"
+            >
+              <FontAwesomeIcon :icon="['fas', 'rotate']" class="icon-btn" :class="{ 'icon-spin': isLoadingWalletBalances }" />
+            </button>
+          </div>
+
           <ul v-if="walletModalView === 'wallets' && wallets.length > 0" class="wallet-list">
             <li
               v-for="wallet in wallets"
@@ -3017,6 +3119,16 @@ onBeforeUnmount(() => {
                 <div>
                   <strong>{{ wallet.name }}</strong>
                   <span v-if="wallet.name === activeWalletName" class="wallet-tag active">active</span>
+                  <div class="wallet-item-balance">
+                    <span v-if="getWalletBalanceEntry(wallet.name).loading" class="hint">Loading balance…</span>
+                    <span v-else-if="getWalletBalanceEntry(wallet.name).error" class="wallet-item-balance-error">Balance unavailable</span>
+                    <span v-else class="wallet-item-balance-amount">
+                      {{ formatBchFromSats(getWalletBalanceEntry(wallet.name).sats) }} BCH
+                      <template v-if="walletFiatValue(getWalletBalanceEntry(wallet.name).sats) !== null">
+                        · {{ formatCurrency(walletFiatValue(getWalletBalanceEntry(wallet.name).sats)) }}
+                      </template>
+                    </span>
+                  </div>
                 </div>
                 <div class="wallet-item-actions">
                   <button class="tiny-btn wallet-row-btn" @click.stop="closeWalletListModal(); openWalletActionSheet(wallet.name)" title="Manage wallet" aria-label="Manage wallet">
