@@ -1,5 +1,7 @@
 # Purze
 
+![Alt](https://repobeats.axiom.co/api/embed/754cf0503977a706ed6724856cf280b40e59358c.svg "Repobeats analytics image")
+
 Purze is a compact, mobile-friendly Bitcoin Cash (BCH) and CashToken web wallet built with Vue 3 + TypeScript.
 
 It is designed around four goals:
