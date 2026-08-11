@@ -277,8 +277,7 @@ const failedIconUris = ref<Record<string, true>>({});
 let copiedTokenTimer: ReturnType<typeof setTimeout> | null = null;
 const notificationMenuOpen = ref(false);
 const notificationMenuEl = ref<HTMLElement | null>(null);
-const notificationIsInFooter = ref(false);
-const notificationMenuStyle = ref<Record<string, string> | null>(null);
+const notificationsModalEl = ref<HTMLElement | null>(null);
 const notificationSettings = ref<Record<NotificationSettingKey, boolean>>({
   sendFunds: true,
   receiveFunds: true,
@@ -665,9 +664,9 @@ function onDocumentClick(event: MouseEvent) {
   if (!notificationMenuOpen.value) return;
   const target = event.target;
   if (!(target instanceof Node)) return;
-  if (!notificationMenuEl.value?.contains(target)) {
-    closeNotificationMenu();
-  }
+  if (notificationMenuEl.value?.contains(target)) return;
+  if (notificationsModalEl.value?.contains(target)) return;
+  closeNotificationMenu();
 }
 
 function onSendModeChange(value: string) {
@@ -2959,6 +2958,15 @@ onBeforeUnmount(() => {
             <FontAwesomeIcon :icon="['fas', 'bell']" class="status-pill-icon" />
             <span v-if="notificationCount > 0" class="status-pill-badge" aria-hidden="true">{{ notificationCount }}</span>
           </button>
+          <button
+            class="status-pill notification-settings-shortcut"
+            type="button"
+            @click="openNotificationSettings"
+            title="Notification settings"
+            aria-label="Notification settings"
+          >
+            <FontAwesomeIcon :icon="['fas', 'sliders']" class="status-pill-icon" />
+          </button>
         </div>
       </div>
     </footer>
@@ -3054,7 +3062,7 @@ onBeforeUnmount(() => {
     </div>
 
     <div v-if="activeOverlayScreen === 'notifications'" class="action-sheet-overlay" @click.self="closeNotificationMenu">
-      <dialog class="action-sheet notifications-modal" open aria-label="Notifications">
+      <dialog class="action-sheet notifications-modal" ref="notificationsModalEl" open aria-label="Notifications">
         <div class="action-sheet-header">
           <div class="action-sheet-title-wrap">
             <strong class="action-sheet-title">Notifications</strong>
@@ -3066,11 +3074,29 @@ onBeforeUnmount(() => {
         </div>
 
         <section class="manage-wallet-info">
-          <div class="wallet-notifications-tabs">
-            <button :class="{ active: notificationPanelView === 'list' }" @click="setNotificationPanelView('list')" type="button">List</button>
-            <button :class="{ active: notificationPanelView === 'settings' }" @click="setNotificationPanelView('settings')" type="button">Settings</button>
-          </div>
-          <div class="wallet-notifications-head-actions">
+          <div class="wallet-notifications-tabs-row">
+            <div class="wallet-modal-tabs wallet-notifications-tabs" role="tablist" aria-label="Notification sections">
+              <button
+                class="wallet-modal-tab"
+                :class="{ active: notificationPanelView === 'list' }"
+                role="tab"
+                :aria-selected="notificationPanelView === 'list'"
+                @click="setNotificationPanelView('list')"
+                type="button"
+              >
+                List
+              </button>
+              <button
+                class="wallet-modal-tab"
+                :class="{ active: notificationPanelView === 'settings' }"
+                role="tab"
+                :aria-selected="notificationPanelView === 'settings'"
+                @click="setNotificationPanelView('settings')"
+                type="button"
+              >
+                Settings
+              </button>
+            </div>
             <button
               v-if="notificationCount > 0 && notificationPanelView === 'list'"
               class="notification-mark-read-btn"
@@ -3115,7 +3141,7 @@ onBeforeUnmount(() => {
                     <span class="notification-item-time">{{ formatNotificationTime(item.createdAt) }}</span>
                   </span>
                 </span>
-                <span class="notification-unread-dot" aria-hidden="true"></span>
+                <span v-if="!item.read" class="notification-unread-dot" aria-hidden="true"></span>
               </button>
             </div>
 
@@ -3123,11 +3149,6 @@ onBeforeUnmount(() => {
               <button class="tiny-btn" :disabled="notificationPage <= 1" @click="notificationPage = Math.max(1, notificationPage - 1)">Prev</button>
               <button class="tiny-btn" :disabled="notificationPage >= notificationTotalPages" @click="notificationPage = Math.min(notificationTotalPages, notificationPage + 1)">Next</button>
               <span class="hint">Showing {{ displayedNotifications.length }} of {{ filteredNotificationEvents.length }} notifications</span>
-            </div>
-
-            <div class="wallet-notification-footer">
-              <button class="tiny-btn" @click="setWalletModalView('wallets')">Back to wallets</button>
-              <button class="tiny-btn" @click="toggleNotificationMenu">Open quick list</button>
             </div>
           </div>
 
