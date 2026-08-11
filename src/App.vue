@@ -47,13 +47,21 @@ type TokenMetadata = {
   iconUri?: string;
 };
 
+type ScanTokenBalance = {
+  category: string;
+  displayName: string;
+  symbol?: string;
+  decimals: number;
+  amount: bigint;
+};
+
 type DerivationScanResult = {
   label: string;
   parent: string;
   full: string;
   address: string;
   balanceSats: bigint;
-  tokenSummary: string;
+  tokenBalances: ScanTokenBalance[];
   error?: string;
 };
 
@@ -382,8 +390,9 @@ const activeSeedPhrase = computed(() => {
   return w?.mnemonic ?? null;
 });
 const activeWalletScanFundedCount = computed(
-  () => activeWalletScanResults.value.filter((r) => r.balanceSats > 0n || !!r.tokenSummary).length,
+  () => activeWalletScanResults.value.filter((r) => r.balanceSats > 0n || r.tokenBalances.length > 0).length,
 );
+const activeWalletScanErrors = computed(() => activeWalletScanResults.value.filter((r) => r.error));
 
 const currencyOptions = computed<SelectOption[]>(() =>
   SUPPORTED_FIAT_CURRENCIES.map((currency) => ({ value: currency, label: currency })),
@@ -1415,6 +1424,31 @@ function hasMissingTokenMetadata(list: TokenSummary[]) {
   return list.some((token) => !tokenNameCache.value[token.category]);
 }
 
+async function resolveScanTokenBalances(tokenCounts: Record<string, bigint>): Promise<ScanTokenBalance[]> {
+  const entries = Object.entries(tokenCounts).filter(([, amount]) => amount > 0n);
+  const resolved = await Promise.all(
+    entries.map(async ([category, amount]) => {
+      const meta = await fetchTokenName(category);
+      return {
+        category,
+        displayName: meta.name,
+        symbol: meta.symbol,
+        decimals: meta.decimals,
+        amount,
+      };
+    }),
+  );
+  if (entries.length > 0) {
+    persistTokenNameCache();
+  }
+  return resolved;
+}
+
+function formatScanTokenBalances(tokenBalances: ScanTokenBalance[]): string {
+  if (tokenBalances.length === 0) return 'none';
+  return tokenBalances.map((t) => `${t.symbol ?? t.displayName}: ${formatTokenAmount(t.amount, t.decimals)}`).join(', ');
+}
+
 async function hydrateTokenNames(list: TokenSummary[]) {
   const missingCategories = list
     .map((token) => token.category)
@@ -2264,7 +2298,7 @@ async function scanImportDerivationPaths() {
         full: candidate.full,
         address: '',
         balanceSats: 0n,
-        tokenSummary: '',
+        tokenBalances: [],
       };
       try {
         const wallet = await HDWallet.fromSeed(seed, candidate.parent, 0, 0);
@@ -2278,13 +2312,11 @@ async function scanImportDerivationPaths() {
             acc[category] = (acc[category] ?? 0n) + (utxo.token?.amount ?? 0n);
             return acc;
           }, {} as Record<string, bigint>);
-        const tokenSummary = Object.entries(tokenCounts)
-          .map(([category, amount]) => `${category}: ${amount.toString()}`)
-          .join(', ');
+        const tokenBalances = await resolveScanTokenBalances(tokenCounts);
 
         scanResult.address = address;
         scanResult.balanceSats = bchBalance;
-        scanResult.tokenSummary = tokenSummary;
+        scanResult.tokenBalances = tokenBalances;
         await wallet.stop();
       } catch (error) {
         scanResult.error = error instanceof Error ? error.message : String(error);
@@ -2319,7 +2351,7 @@ async function scanActiveWalletDerivationPaths() {
         full: candidate.full,
         address: '',
         balanceSats: 0n,
-        tokenSummary: '',
+        tokenBalances: [],
       };
       try {
         const wallet = await HDWallet.fromSeed(seed, candidate.parent, 0, 0);
@@ -2333,13 +2365,11 @@ async function scanActiveWalletDerivationPaths() {
             acc[category] = (acc[category] ?? 0n) + (utxo.token?.amount ?? 0n);
             return acc;
           }, {} as Record<string, bigint>);
-        const tokenSummary = Object.entries(tokenCounts)
-          .map(([category, amount]) => `${category}: ${amount.toString()}`)
-          .join(', ');
+        const tokenBalances = await resolveScanTokenBalances(tokenCounts);
 
         scanResult.address = address;
         scanResult.balanceSats = bchBalance;
-        scanResult.tokenSummary = tokenSummary;
+        scanResult.tokenBalances = tokenBalances;
         await wallet.stop();
       } catch (error) {
         scanResult.error = error instanceof Error ? error.message : String(error);
@@ -3950,26 +3980,49 @@ onBeforeUnmount(() => {
                   Scan results
                   <span class="scan-results-count">{{ activeWalletScanFundedCount }} of {{ activeWalletScanResults.length }} paths with funds</span>
                 </summary>
-                <div class="scan-results-list">
-                  <div
-                    v-for="result in activeWalletScanResults"
-                    :key="result.parent"
-                    class="scan-result-item"
-                    :class="{ 'has-funds': result.balanceSats > 0n || !!result.tokenSummary }"
-                  >
-                    <div class="scan-result-row">
-                      <span class="scan-label">{{ result.label }}</span>
-                      <button
-                        class="tiny-btn"
-                        type="button"
-                        :disabled="isUpdatingDerivation"
-                        @click="switchActiveWalletToScannedPath(result)"
-                      >Switch here</button>
-                    </div>
-                    <div class="scan-result-value"><strong>Address:</strong> {{ result.address || 'Unable to derive' }}</div>
-                    <div class="scan-result-value"><strong>BCH:</strong> {{ formatBchFromSats(result.balanceSats) }} · <strong>Tokens:</strong> {{ result.tokenSummary || 'none' }}</div>
-                    <div class="scan-result-value" v-if="result.error"><strong>Error:</strong> {{ result.error }}</div>
-                  </div>
+                <div class="scan-table-wrap">
+                  <table class="scan-table">
+                    <thead>
+                      <tr>
+                        <th>Path</th>
+                        <th>Address</th>
+                        <th>BCH</th>
+                        <th>Tokens</th>
+                        <th class="scan-table-action-col"><span class="sr-only">Action</span></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr
+                        v-for="result in activeWalletScanResults"
+                        :key="result.parent"
+                        :class="{ 'has-funds': result.balanceSats > 0n || result.tokenBalances.length > 0 }"
+                      >
+                        <td class="scan-table-label">{{ result.label }}</td>
+                        <td class="scan-table-address" :title="result.address">{{ result.address ? formatAddressSingleLine(result.address) : 'Unable to derive' }}</td>
+                        <td class="scan-table-bch">{{ formatBchFromSats(result.balanceSats) }}</td>
+                        <td class="scan-table-tokens">
+                          <span v-if="result.tokenBalances.length === 0" class="hint">—</span>
+                          <ul v-else class="scan-token-list">
+                            <li v-for="token in result.tokenBalances" :key="token.category">
+                              {{ token.symbol ?? token.displayName }}: {{ formatTokenAmount(token.amount, token.decimals) }}
+                            </li>
+                          </ul>
+                        </td>
+                        <td class="scan-table-action">
+                          <button
+                            class="tiny-btn"
+                            type="button"
+                            :disabled="isUpdatingDerivation"
+                            @click="switchActiveWalletToScannedPath(result)"
+                          >Switch</button>
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+                <div class="scan-table-errors" v-if="activeWalletScanErrors.length > 0">
+                  <p class="hint">Some paths could not be scanned:</p>
+                  <p class="hint" v-for="result in activeWalletScanErrors" :key="`err-${result.parent}`">{{ result.label }}: {{ result.error }}</p>
                 </div>
               </details>
             </div>
@@ -4071,7 +4124,7 @@ onBeforeUnmount(() => {
                     <button class="tiny-btn" type="button" @click="applyScannedDerivationPath(result)">Select</button>
                   </div>
                   <div class="scan-result-value"><strong>Address:</strong> {{ result.address || 'Unable to derive' }}</div>
-                  <div class="scan-result-value"><strong>BCH:</strong> {{ formatBchFromSats(result.balanceSats) }} · <strong>Tokens:</strong> {{ result.tokenSummary || 'none' }}</div>
+                  <div class="scan-result-value"><strong>BCH:</strong> {{ formatBchFromSats(result.balanceSats) }} · <strong>Tokens:</strong> {{ formatScanTokenBalances(result.tokenBalances) }}</div>
                   <div class="scan-result-value" v-if="result.error"><strong>Error:</strong> {{ result.error }}</div>
                 </div>
               </div>
