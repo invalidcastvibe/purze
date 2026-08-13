@@ -59,6 +59,9 @@ type DerivationScanResult = {
   label: string;
   parent: string;
   full: string;
+  chain: number;
+  index: number;
+  switchable: boolean;
   address: string;
   balanceSats: bigint;
   tokenBalances: ScanTokenBalance[];
@@ -256,8 +259,10 @@ const hiddenTokenCategories = ref<Record<string, true>>({});
 const favoriteTokenCategories = ref<Record<string, true>>({});
 const usdRateCache = ref<UsdRateCache | null>(null);
 const sendMode = ref<'bch' | 'token'>('bch');
+const sendModalTabView = ref<'send' | 'history'>('send');
 const sendToAddress = ref('');
 const sendBchAmount = ref('');
+const sendUsdAmount = ref('');
 const sendTokenCategory = ref('');
 const sendTokenAmount = ref('');
 const sendDestinationMode = ref<'external' | 'wallet'>('external');
@@ -720,6 +725,10 @@ function setNotificationPanelView(view: 'list' | 'settings') {
   notificationPanelView.value = view;
 }
 
+function setSendModalTabView(view: 'send' | 'history') {
+  sendModalTabView.value = view;
+}
+
 function closeWalletListModal() {
   if (activeOverlayScreen.value === 'wallet-list') {
     activeOverlayScreen.value = 'none';
@@ -753,9 +762,11 @@ function closeWalletConnectModal() {
 
 function openSendAssetModalForBch() {
   sendMode.value = 'bch';
+  sendModalTabView.value = 'send';
   sendTokenCategory.value = '';
   sendToAddress.value = '';
   sendBchAmount.value = '';
+  sendUsdAmount.value = '';
   sendTokenAmount.value = '';
   sendDestinationMode.value = 'external';
   sendToWalletName.value = '';
@@ -767,9 +778,11 @@ function openSendAssetModalForBch() {
 
 function openSendAssetModalForToken(category: string) {
   sendMode.value = 'token';
+  sendModalTabView.value = 'send';
   sendTokenCategory.value = category;
   sendToAddress.value = '';
   sendBchAmount.value = '';
+  sendUsdAmount.value = '';
   sendTokenAmount.value = '';
   sendDestinationMode.value = 'external';
   sendToWalletName.value = '';
@@ -881,9 +894,52 @@ function parseTokenAmount(input: string, decimals: number): bigint | null {
   return whole * (10n ** BigInt(decimals)) + fraction;
 }
 
+function formatBchAmountPlain(bch: number): string {
+  if (!Number.isFinite(bch) || bch <= 0) return '';
+  const trimmed = bch.toFixed(8).replace(/0+$/, '').replace(/\.$/, '');
+  return trimmed;
+}
+
+let isSyncingSendAmounts = false;
+
+function onSendBchAmountInput(event: Event) {
+  const target = event.target as HTMLInputElement;
+  sendBchAmount.value = target.value;
+  if (isSyncingSendAmounts) return;
+  if (bchUsdRate.value === null) return;
+
+  const sats = parseBchToSats(target.value);
+  isSyncingSendAmounts = true;
+  if (sats === null) {
+    sendUsdAmount.value = '';
+  } else {
+    const usd = (Number(sats) / 100_000_000) * bchUsdRate.value;
+    sendUsdAmount.value = usd > 0 ? usd.toFixed(2) : '';
+  }
+  isSyncingSendAmounts = false;
+}
+
+function onSendUsdAmountInput(event: Event) {
+  const target = event.target as HTMLInputElement;
+  sendUsdAmount.value = target.value;
+  if (isSyncingSendAmounts) return;
+  if (bchUsdRate.value === null || bchUsdRate.value <= 0) return;
+
+  const trimmed = target.value.trim();
+  isSyncingSendAmounts = true;
+  if (!/^\d+(\.\d{1,2})?$/.test(trimmed) || Number(trimmed) <= 0) {
+    sendBchAmount.value = '';
+  } else {
+    const bch = Number(trimmed) / bchUsdRate.value;
+    sendBchAmount.value = formatBchAmountPlain(bch);
+  }
+  isSyncingSendAmounts = false;
+}
+
 function resetSendForm() {
   sendToAddress.value = '';
   sendBchAmount.value = '';
+  sendUsdAmount.value = '';
   sendTokenAmount.value = '';
   sendDestinationMode.value = 'external';
   sendToWalletName.value = '';
@@ -2269,6 +2325,10 @@ async function createOrImportWallet() {
 }
 
 async function applyScannedDerivationPath(result: DerivationScanResult) {
+  if (!result.switchable) {
+    derivationScanMessage.value = `${result.label} is a single detection-only key, not a receive chain - it can't be selected as the wallet's derivation path.`;
+    return;
+  }
   const inferred = inferDerivationSelection(result.parent);
   derivationUpdateType.value = inferred.type;
   customDerivationPathUpdate.value = inferred.customPath;
@@ -2296,12 +2356,15 @@ async function scanImportDerivationPaths() {
         label: candidate.label,
         parent: candidate.parent,
         full: candidate.full,
+        chain: candidate.chain,
+        index: candidate.index,
+        switchable: candidate.switchable,
         address: '',
         balanceSats: 0n,
         tokenBalances: [],
       };
       try {
-        const wallet = await HDWallet.fromSeed(seed, candidate.parent, 0, 0);
+        const wallet = await HDWallet.fromSeed(seed, candidate.parent, candidate.chain, candidate.index);
         const address = wallet.getDepositAddress(0);
         const utxos = await wallet.getUtxos();
         const bchBalance = utxos.filter((u) => u.token === undefined).reduce((sum, u) => sum + u.satoshis, 0n);
@@ -2349,12 +2412,15 @@ async function scanActiveWalletDerivationPaths() {
         label: candidate.label,
         parent: candidate.parent,
         full: candidate.full,
+        chain: candidate.chain,
+        index: candidate.index,
+        switchable: candidate.switchable,
         address: '',
         balanceSats: 0n,
         tokenBalances: [],
       };
       try {
-        const wallet = await HDWallet.fromSeed(seed, candidate.parent, 0, 0);
+        const wallet = await HDWallet.fromSeed(seed, candidate.parent, candidate.chain, candidate.index);
         const address = wallet.getDepositAddress(0);
         const utxos = await wallet.getUtxos();
         const bchBalance = utxos.filter((u) => u.token === undefined).reduce((sum, u) => sum + u.satoshis, 0n);
@@ -2388,6 +2454,10 @@ async function scanActiveWalletDerivationPaths() {
 
 async function switchActiveWalletToScannedPath(result: DerivationScanResult) {
   if (isUpdatingDerivation.value) return;
+  if (!result.switchable) {
+    activeWalletScanMessage.value = `${result.label} is a single detection-only key, not a receive chain - it can't be switched onto.`;
+    return;
+  }
   const inferred = inferDerivationSelection(result.parent);
   derivationUpdateType.value = inferred.type;
   customDerivationPathUpdate.value = inferred.customPath;
@@ -3573,7 +3643,32 @@ onBeforeUnmount(() => {
           </button>
         </div>
 
-        <div class="manage-wallet-info">
+        <div class="wallet-notifications-tabs-row send-modal-tabs-row">
+          <div class="wallet-modal-tabs" role="tablist" aria-label="Send sections">
+            <button
+              class="wallet-modal-tab"
+              :class="{ active: sendModalTabView === 'send' }"
+              role="tab"
+              :aria-selected="sendModalTabView === 'send'"
+              @click="setSendModalTabView('send')"
+              type="button"
+            >
+              Send
+            </button>
+            <button
+              class="wallet-modal-tab"
+              :class="{ active: sendModalTabView === 'history' }"
+              role="tab"
+              :aria-selected="sendModalTabView === 'history'"
+              @click="setSendModalTabView('history')"
+              type="button"
+            >
+              Recent Transactions
+            </button>
+          </div>
+        </div>
+
+        <div class="manage-wallet-info" v-if="sendModalTabView === 'send'">
           <div class="row" v-if="hasOtherWallets">
             <label for="send-modal-destination-mode-select">Send To</label>
             <UiSelect
@@ -3610,7 +3705,27 @@ onBeforeUnmount(() => {
 
           <div class="row" v-if="sendMode === 'bch'">
             <label for="send-modal-bch-amount-input">Amount (BCH)</label>
-            <input id="send-modal-bch-amount-input" v-model="sendBchAmount" placeholder="0.00001" />
+            <input
+              id="send-modal-bch-amount-input"
+              :value="sendBchAmount"
+              @input="onSendBchAmountInput"
+              placeholder="0.00001"
+              inputmode="decimal"
+            />
+          </div>
+
+          <div class="row" v-if="sendMode === 'bch'">
+            <label for="send-modal-usd-amount-input">Amount (USD equivalent)</label>
+            <input
+              id="send-modal-usd-amount-input"
+              :value="sendUsdAmount"
+              @input="onSendUsdAmountInput"
+              :placeholder="bchUsdRate === null ? 'Rate unavailable' : '0.00'"
+              :disabled="bchUsdRate === null"
+              inputmode="decimal"
+            />
+            <p class="hint" v-if="bchUsdRate !== null">1 BCH &asymp; {{ formatUsd(bchUsdRate) }}</p>
+            <p class="hint" v-else>USD rate is unavailable right now, so this field is disabled.</p>
           </div>
 
           <div class="row" v-else>
@@ -3629,7 +3744,7 @@ onBeforeUnmount(() => {
 
         </div>
 
-        <div class="manage-wallet-info send-history-card" v-if="sendMode === 'token' || sendMode === 'bch'">
+        <div class="manage-wallet-info send-history-card" v-if="sendModalTabView === 'history' && (sendMode === 'token' || sendMode === 'bch')">
             <div class="send-history-head">
               <strong><FontAwesomeIcon :icon="['fas', 'rotate']" class="icon-btn" />Recent {{ sendMode === 'token' ? 'Token' : 'BCH' }} Transactions</strong>
               <button class="tiny-btn" @click="loadTokenSendHistory" :disabled="isLoadingTokenSendHistory" aria-label="Refresh transaction history" title="Refresh transaction history">
@@ -3994,7 +4109,7 @@ onBeforeUnmount(() => {
                     <tbody>
                       <tr
                         v-for="result in activeWalletScanResults"
-                        :key="result.parent"
+                        :key="result.full"
                         :class="{ 'has-funds': result.balanceSats > 0n || result.tokenBalances.length > 0 }"
                       >
                         <td class="scan-table-label">{{ result.label }}</td>
@@ -4010,11 +4125,13 @@ onBeforeUnmount(() => {
                         </td>
                         <td class="scan-table-action">
                           <button
+                            v-if="result.switchable"
                             class="tiny-btn"
                             type="button"
                             :disabled="isUpdatingDerivation"
                             @click="switchActiveWalletToScannedPath(result)"
                           >Switch</button>
+                          <span v-else class="hint scan-detect-only" title="Single detection-only key - not a switchable receive chain">detect-only</span>
                         </td>
                       </tr>
                     </tbody>
@@ -4118,10 +4235,11 @@ onBeforeUnmount(() => {
                 <strong>Scan results</strong>
               </div>
               <div class="scan-results-list">
-                <div v-for="result in derivationScanResults" :key="result.parent" class="scan-result-item">
+                <div v-for="result in derivationScanResults" :key="result.full" class="scan-result-item">
                   <div class="scan-result-row">
                     <span class="scan-label">{{ result.label }}</span>
-                    <button class="tiny-btn" type="button" @click="applyScannedDerivationPath(result)">Select</button>
+                    <button v-if="result.switchable" class="tiny-btn" type="button" @click="applyScannedDerivationPath(result)">Select</button>
+                    <span v-else class="hint scan-detect-only" title="Single detection-only key - not a switchable receive chain">detect-only</span>
                   </div>
                   <div class="scan-result-value"><strong>Address:</strong> {{ result.address || 'Unable to derive' }}</div>
                   <div class="scan-result-value"><strong>BCH:</strong> {{ formatBchFromSats(result.balanceSats) }} · <strong>Tokens:</strong> {{ formatScanTokenBalances(result.tokenBalances) }}</div>

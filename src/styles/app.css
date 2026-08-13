@@ -914,6 +914,12 @@
 .scan-table-action-col {
   width: 1%;
 }
+.scan-detect-only {
+  font-size: 0.72rem;
+  font-style: italic;
+  white-space: nowrap;
+  opacity: 0.75;
+}
 .scan-table-errors {
   margin-top: 8px;
   display: grid;
