@@ -336,7 +336,7 @@ const wcUri = ref('');
 const walletKit = ref<IWalletKit | null>(null);
 const wcSessions = ref<SessionMap>({});
 const pendingWcRequests = ref<PendingWcRequest[]>([]);
-const pendingWcConnectionProposal = ref<PendingWcConnectionProposal | null>(null);
+const pendingWcConnectionProposals = ref<PendingWcConnectionProposal[]>([]);
 const isHandlingWcConnectionProposal = ref(false);
 const isHandlingWcApproval = ref(false);
 
@@ -485,7 +485,9 @@ const assetItems = computed<AssetItem[]>(() => {
 const previewAssets = computed(() => assetItems.value.slice(0, 100));
 const currentWalletButtonLabel = computed(() => activeWalletName.value || 'Select Wallet');
 const pendingWcApproval = computed(() => pendingWcRequests.value[0] ?? null);
-const hasPendingWcConnectionProposal = computed(() => pendingWcConnectionProposal.value !== null);
+const pendingWcConnectionProposal = computed(() => pendingWcConnectionProposals.value[0] ?? null);
+const hasPendingWcConnectionProposal = computed(() => pendingWcConnectionProposals.value.length > 0);
+const pendingWcConnectionProposalCount = computed(() => pendingWcConnectionProposals.value.length);
 const hasActiveWcSessions = computed(() => Object.keys(wcSessions.value).length > 0);
 const wcSessionEntries = computed(() => Object.entries(wcSessions.value));
 const wcSessionCount = computed(() => wcSessionEntries.value.length);
@@ -2625,6 +2627,10 @@ function getWalletConnectNamespaces() {
   };
 }
 
+function dequeueWcConnectionProposal(id: number) {
+  pendingWcConnectionProposals.value = pendingWcConnectionProposals.value.filter((item) => item.id !== id);
+}
+
 async function approvePendingWcConnectionProposal() {
   if (!walletKit.value || !pendingWcConnectionProposal.value || isHandlingWcConnectionProposal.value) return;
   isHandlingWcConnectionProposal.value = true;
@@ -2632,7 +2638,7 @@ async function approvePendingWcConnectionProposal() {
   try {
     const namespaces = getWalletConnectNamespaces();
     await walletKit.value.approveSession({ id: proposal.id, namespaces });
-    pendingWcConnectionProposal.value = null;
+    dequeueWcConnectionProposal(proposal.id);
     refreshSessionMap();
     status.value = `WalletConnect approved for ${proposal.appName}`;
   } catch (error) {
@@ -2651,7 +2657,7 @@ async function rejectPendingWcConnectionProposal() {
       id: proposal.id,
       reason: { code: 5000, message: 'User rejected connection.' },
     });
-    pendingWcConnectionProposal.value = null;
+    dequeueWcConnectionProposal(proposal.id);
     status.value = `WalletConnect connection rejected for ${proposal.appName}`;
   } finally {
     isHandlingWcConnectionProposal.value = false;
@@ -2767,21 +2773,24 @@ async function initWalletConnect() {
         return;
       }
 
-      if (pendingWcConnectionProposal.value) {
+      // Cap the queue so a burst of proposals (e.g. a malicious/broken dApp) can't be used
+      // to spam unbounded pending approvals into memory.
+      const MAX_PENDING_WC_PROPOSALS = 5;
+      if (pendingWcConnectionProposals.value.length >= MAX_PENDING_WC_PROPOSALS) {
         await instance.rejectSession({
           id: proposal.id,
-          reason: { code: 5000, message: 'Another connection approval is pending.' },
+          reason: { code: 5000, message: 'Too many pending connection approvals.' },
         });
-        status.value = `WalletConnect queued request from ${appName} was rejected: approval already pending`;
+        status.value = `WalletConnect request from ${appName} was rejected: too many pending approvals`;
         return;
       }
 
-      pendingWcConnectionProposal.value = {
-        id: proposal.id,
-        appName,
-        appUrl,
-        appIcon,
-      };
+      // Multiple dApps can each have their own connection proposal queued for review;
+      // approving/pairing one does not affect another dApp's existing sessions or proposals.
+      pendingWcConnectionProposals.value = [
+        ...pendingWcConnectionProposals.value,
+        { id: proposal.id, appName, appUrl, appIcon },
+      ];
       pushNotification('walletConnectApproval', `${appName} wants to connect to your wallet.`);
       activeOverlayScreen.value = 'wallet-connect';
       status.value = `Connection approval required for ${appName}`;
@@ -3855,6 +3864,7 @@ onBeforeUnmount(() => {
               <strong class="wc-section-title"><FontAwesomeIcon :icon="['fas', 'triangle-exclamation']" class="wc-section-icon" />Connection Request</strong>
               <span class="hint">Review this webapp before connecting your wallet</span>
             </div>
+            <span v-if="pendingWcConnectionProposalCount > 1" class="wallet-tag">+{{ pendingWcConnectionProposalCount - 1 }} more waiting</span>
           </div>
           <div class="wc-proposal-dapp">
             <div class="wc-dapp-avatar" aria-hidden="true">
@@ -3921,10 +3931,28 @@ onBeforeUnmount(() => {
           <div class="wc-section-head">
             <div class="wc-section-title-wrap">
               <strong class="wc-section-title"><FontAwesomeIcon :icon="['fas', 'plug']" class="wc-section-icon" />Connect to a dApp</strong>
-              <span class="hint">{{ wcSessionCount === 0 ? 'Paste a WalletConnect URI from the webapp' : 'Connected webapp details' }}</span>
+              <span class="hint">{{ wcSessionCount === 0 ? 'Paste a WalletConnect URI from the webapp' : 'Paste another WalletConnect URI to add a dApp' }}</span>
             </div>
           </div>
-          <div v-if="wcSessionCount === 0 && !hasPendingWcConnectionProposal">
+          <div v-if="hasPendingWcConnectionProposal" class="wc-connected-summary">
+            <p class="hint">A connection request is waiting above. Approve or reject it to continue.</p>
+          </div>
+          <template v-else>
+            <div class="wc-connected-summary" v-if="wcSessionCount > 0">
+              <div class="manage-field">
+                <span class="manage-label">Connected dApp{{ wcSessionCount > 1 ? 's' : '' }}</span>
+                <span>{{ wcSessionEntries[0]?.[1]?.peerName || 'Unknown dApp' }}</span>
+              </div>
+              <div class="manage-field">
+                <span class="manage-label">Website</span>
+                <span>{{ getDisplayHost(wcSessionEntries[0]?.[1]?.peerUrl || '') }}</span>
+              </div>
+              <div class="manage-field">
+                <span class="manage-label">Accounts</span>
+                <span>{{ wcSessionEntries[0]?.[1]?.accounts.length || 0 }}</span>
+              </div>
+              <p class="hint" v-if="wcSessionCount > 1">{{ wcSessionCount }} dApps are connected. Full session details are listed below.</p>
+            </div>
             <div class="row wc-uri-row">
               <label for="wc-uri-input" class="wc-uri-label"><FontAwesomeIcon :icon="['fas', 'copy']" class="wc-inline-icon" />Paste WalletConnect URI Here</label>
               <input id="wc-uri-input" class="wc-uri-input" v-model="wcUri" placeholder="wc:..." />
@@ -3932,25 +3960,7 @@ onBeforeUnmount(() => {
             <p class="hint wc-uri-hint">Tip: Copy the full URI from the webapp and paste it into the highlighted field above.</p>
             <button @click="pairWalletConnect" :disabled="!activeWallet || !wcUri.trim()"><FontAwesomeIcon :icon="['fas', 'plug']" class="icon-btn" />Pair and Connect</button>
             <p class="hint" v-if="!activeWallet">Select a wallet first before pairing.</p>
-          </div>
-          <div v-else-if="hasPendingWcConnectionProposal" class="wc-connected-summary">
-            <p class="hint">A connection request is waiting above. Approve or reject it to continue.</p>
-          </div>
-          <div v-else class="wc-connected-summary">
-            <div class="manage-field">
-              <span class="manage-label">Connected dApp</span>
-              <span>{{ wcSessionEntries[0]?.[1]?.peerName || 'Unknown dApp' }}</span>
-            </div>
-            <div class="manage-field">
-              <span class="manage-label">Website</span>
-              <span>{{ getDisplayHost(wcSessionEntries[0]?.[1]?.peerUrl || '') }}</span>
-            </div>
-            <div class="manage-field">
-              <span class="manage-label">Accounts</span>
-              <span>{{ wcSessionEntries[0]?.[1]?.accounts.length || 0 }}</span>
-            </div>
-            <p class="hint" v-if="wcSessionCount > 1">{{ wcSessionCount }} dApps are connected. Full session details are listed below.</p>
-          </div>
+          </template>
         </div>
 
         <div class="manage-wallet-info wc-sessions-card">

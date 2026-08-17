@@ -1409,6 +1409,8 @@
   padding: 12px;
 }
 .action-sheet {
+  position: relative;
+  inset: auto;
   width: min(700px, 100%);
   max-height: min(88dvh, 760px);
   height: auto;
