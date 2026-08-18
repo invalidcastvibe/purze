@@ -344,6 +344,17 @@ Config.UseIndexedDBCache = true;
 BaseWallet.StorageProvider = IndexedDBProvider;
 Config.DefaultParentDerivationPath = DERIVATION_PATHS.standard.parent;
 
+// Explicitly pin Electrum servers, excluding blackie.c3-soft.com which is
+// frequently unreachable and was causing balance-loading failures.
+Config.DefaultElectrumServers = {
+  mainnet: [
+    'wss://bch.imaginary.cash:50004',
+    'wss://electrum.imaginary.cash:50004',
+    'wss://fulcrum.fountainhead.cash:50004',
+  ],
+  testnet: ['wss://chipnet.imaginary.cash:50004'],
+};
+
 const walletNames = computed(() => wallets.value.map((w) => w.name));
 const grandTotalSats = computed(() => wallets.value.reduce((sum, w) => sum + (walletBalances.value[w.name]?.sats ?? 0n), 0n));
 const grandTotalFiat = computed(() => {
