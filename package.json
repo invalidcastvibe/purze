@@ -9,19 +9,19 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@bch-wc2/interfaces": "0.0.16",
     "@bitauth/libauth": "3.1.0-next.8",
     "@fortawesome/fontawesome-svg-core": "^7.3.1",
     "@fortawesome/free-solid-svg-icons": "^7.3.1",
     "@fortawesome/vue-fontawesome": "^3.3.3",
     "@mainnet-cash/indexeddb-storage": "3.1.7",
     "@reown/walletkit": "1.5.6",
-    "@walletconnect/core": "2.23.9",
+    "@walletconnect/core": "2.23.10",
     "mainnet-js": "3.1.7",
     "qrcode": "^1.5.4",
     "vue": "3.5.40"
   },
   "devDependencies": {
+    "@bch-wc2/interfaces": "^0.0.16",
     "@types/node": "24.13.2",
     "@vitejs/plugin-vue": "6.0.1",
     "typescript": "5.8.3",

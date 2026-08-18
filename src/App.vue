@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
-import { BaseWallet, Config, HDWallet, NetworkType, TestNetHDWallet, TestNetWallet, TokenSendRequest, UnitEnum, Wallet, convert } from 'mainnet-js';
+import { BaseWallet, Config, DefaultProvider, HDWallet, NetworkType, TestNetHDWallet, TestNetWallet, TokenSendRequest, UnitEnum, Wallet, convert } from 'mainnet-js';
 import { IndexedDBProvider } from '@mainnet-cash/indexeddb-storage';
 import type { IWalletKit, WalletKitTypes } from '@reown/walletkit';
 import { binToHex, encodeLockingBytecodeP2pkh, secp256k1, sha256 } from '@bitauth/libauth';
@@ -344,16 +344,21 @@ Config.UseIndexedDBCache = true;
 BaseWallet.StorageProvider = IndexedDBProvider;
 Config.DefaultParentDerivationPath = DERIVATION_PATHS.standard.parent;
 
-// Explicitly pin Electrum servers, excluding blackie.c3-soft.com which is
-// frequently unreachable and was causing balance-loading failures.
-Config.DefaultElectrumServers = {
-  mainnet: [
-    'wss://bch.imaginary.cash:50004',
-    'wss://electrum.imaginary.cash:50004',
-    'wss://fulcrum.fountainhead.cash:50004',
-  ],
-  testnet: ['wss://chipnet.imaginary.cash:50004'],
-};
+// mainnet-js normally talks to a single random Electrum/Fulcrum server (often
+// blackie.c3-soft.com). If that one server is down, blocked, or refuses the
+// websocket handshake, every wallet call fails with an ERR_CONNECTION_REFUSED
+// style error. Giving it a list of known-good public servers instead lets it
+// fall back to the next one automatically, the same way Cashonize does.
+DefaultProvider.servers.mainnet = [
+  'wss://bch.imaginary.cash:50004',
+  'wss://blackie.c3-soft.com:50004',
+  'wss://fulcrum.jettscythe.xyz:50004',
+  'wss://cashnode.bch.ninja:50004',
+];
+DefaultProvider.servers.testnet = [
+  'wss://chipnet.imaginary.cash:50004',
+  'wss://chipnet.bch.ninja:50004',
+];
 
 const walletNames = computed(() => wallets.value.map((w) => w.name));
 const grandTotalSats = computed(() => wallets.value.reduce((sum, w) => sum + (walletBalances.value[w.name]?.sats ?? 0n), 0n));
