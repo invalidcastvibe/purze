@@ -3,7 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { BaseWallet, Config, DefaultProvider, HDWallet, NetworkType, TestNetHDWallet, TestNetWallet, TokenSendRequest, UnitEnum, Wallet, convert } from 'mainnet-js';
 import { IndexedDBProvider } from '@mainnet-cash/indexeddb-storage';
 import type { IWalletKit, WalletKitTypes } from '@reown/walletkit';
-import { binToHex, encodeLockingBytecodeP2pkh, secp256k1, sha256 } from '@bitauth/libauth';
+import { base58AddressToLockingBytecode, binToHex, encodeLockingBytecodeP2pkh, lockingBytecodeToCashAddress, secp256k1, sha256 } from '@bitauth/libauth';
 import type { WcSignMessageRequest, WcSignTransactionRequest } from '@bch-wc2/interfaces';
 import { DERIVATION_PATHS, DERIVATION_SCAN_CANDIDATES, type DerivationPathType, resolveDerivationPaths } from './lib/derivation';
 import UiSelect from './components/UiSelect.vue';
@@ -472,6 +472,11 @@ const hiddenTokenCount = computed(() => hiddenTokenList.value.length);
 const hiddenAssetItems = computed<AssetItem[]>(() => hiddenTokenList.value.map((token) => toTokenAssetItem(token)));
 const sendableTokens = computed(() => visibleTokenList.value.filter((token) => token.fungibleAmount > 0n));
 const selectedSendToken = computed(() => sendableTokens.value.find((token) => token.category === sendTokenCategory.value) ?? null);
+const externalSendAddressResolution = computed<DestinationResolution>(() => {
+  if (sendDestinationMode.value !== 'external') return { address: null, isLegacy: false, error: null };
+  const isMainnet = !activeWallet.value || activeWallet.value.network === NetworkType.Mainnet;
+  return resolveDestinationAddress(sendToAddress.value, isMainnet, sendMode.value === 'token');
+});
 const selectedReceiveAddress = computed(() => (receiveAddressType.value === 'token' ? tokenWalletAddress.value : walletAddress.value));
 const sendTokenOptions = computed<SelectOption[]>(() =>
   sendableTokens.value.map((token) => ({
@@ -912,6 +917,60 @@ function parseTokenAmount(input: string, decimals: number): bigint | null {
   return whole * (10n ** BigInt(decimals)) + fraction;
 }
 
+type DestinationResolution = {
+  address: string | null;
+  isLegacy: boolean;
+  error: string | null;
+};
+
+// Base58Check version bytes for legacy ("1...", "3...") addresses.
+const LEGACY_VERSION_MAINNET_P2PKH = 0x00;
+const LEGACY_VERSION_MAINNET_P2SH = 0x05;
+const LEGACY_VERSION_TESTNET_P2PKH = 0x6f;
+const LEGACY_VERSION_TESTNET_P2SH = 0xc4;
+
+function looksLikeLegacyAddress(input: string): boolean {
+  // Legacy BCH/BTC-style Base58Check addresses: no ':' prefix, start with 1/3 (mainnet) or m/n/2 (testnet).
+  return /^[123mn][a-km-zA-HJ-NP-Z1-9]{25,39}$/.test(input);
+}
+
+// Accepts a raw destination string as typed by the user and, if it's a legacy Base58 address,
+// converts it to the equivalent CashAddress. CashAddress-format input (with or without a
+// 'bitcoincash:'/'bchtest:' prefix) is passed through unchanged, since mainnet-js already
+// validates that format at send time.
+function resolveDestinationAddress(rawInput: string, isMainnet: boolean, wantsTokenSupport: boolean): DestinationResolution {
+  const trimmed = rawInput.trim();
+  if (!trimmed) return { address: null, isLegacy: false, error: null };
+  if (!looksLikeLegacyAddress(trimmed)) {
+    return { address: trimmed, isLegacy: false, error: null };
+  }
+
+  const decoded = base58AddressToLockingBytecode(trimmed);
+  if (typeof decoded === 'string') {
+    return { address: null, isLegacy: true, error: `Invalid legacy address: ${decoded}` };
+  }
+
+  const isTestnetVersion = decoded.version === LEGACY_VERSION_TESTNET_P2PKH || decoded.version === LEGACY_VERSION_TESTNET_P2SH;
+  const isMainnetVersion = decoded.version === LEGACY_VERSION_MAINNET_P2PKH || decoded.version === LEGACY_VERSION_MAINNET_P2SH;
+  if (!isTestnetVersion && !isMainnetVersion) {
+    return { address: null, isLegacy: true, error: 'Unrecognized legacy address format' };
+  }
+  if (isMainnet && !isMainnetVersion) {
+    return { address: null, isLegacy: true, error: 'This is a testnet legacy address, but the active wallet is mainnet' };
+  }
+  if (!isMainnet && !isTestnetVersion) {
+    return { address: null, isLegacy: true, error: 'This is a mainnet legacy address, but the active wallet is testnet' };
+  }
+
+  const prefix = isMainnet ? 'bitcoincash' : 'bchtest';
+  const encoded = lockingBytecodeToCashAddress({ bytecode: decoded.bytecode, prefix, tokenSupport: wantsTokenSupport });
+  if (typeof encoded === 'string') {
+    return { address: null, isLegacy: true, error: `Could not convert legacy address: ${encoded}` };
+  }
+
+  return { address: encoded.address, isLegacy: true, error: null };
+}
+
 function formatBchAmountPlain(bch: number): string {
   if (!Number.isFinite(bch) || bch <= 0) return '';
   const trimmed = bch.toFixed(8).replace(/0+$/, '').replace(/\.$/, '');
@@ -1072,8 +1131,16 @@ async function sendBch() {
     return;
   }
 
-  const cashaddr = sendToAddress.value.trim();
+  const isMainnet = activeWallet.value.network === NetworkType.Mainnet;
+  const destination = sendDestinationMode.value === 'external'
+    ? resolveDestinationAddress(sendToAddress.value, isMainnet, false)
+    : { address: sendToAddress.value.trim(), isLegacy: false, error: null };
   const sats = parseBchToSats(sendBchAmount.value);
+  if (destination.error) {
+    status.value = destination.error;
+    return;
+  }
+  const cashaddr = destination.address;
   if (!cashaddr) {
     status.value = 'Destination address is required';
     return;
@@ -1105,10 +1172,18 @@ async function sendCashToken() {
     return;
   }
 
-  const cashaddr = sendToAddress.value.trim();
+  const isMainnet = activeWallet.value.network === NetworkType.Mainnet;
+  const destination = sendDestinationMode.value === 'external'
+    ? resolveDestinationAddress(sendToAddress.value, isMainnet, true)
+    : { address: sendToAddress.value.trim(), isLegacy: false, error: null };
   const category = sendTokenCategory.value;
   const selectedToken = sendableTokens.value.find((token) => token.category === category);
   const amount = parseTokenAmount(sendTokenAmount.value, selectedToken?.decimals ?? 0);
+  if (destination.error) {
+    status.value = destination.error;
+    return;
+  }
+  const cashaddr = destination.address;
   if (!cashaddr) {
     status.value = 'Destination token address is required';
     return;
@@ -3724,8 +3799,10 @@ onBeforeUnmount(() => {
             <input
               id="send-modal-to-address-input"
               v-model="sendToAddress"
-              :placeholder="sendMode === 'token' ? 'bitcoincash:... token address' : 'bitcoincash:... BCH address'"
+              :placeholder="sendMode === 'token' ? 'bitcoincash:... token address (legacy 1.../3... also accepted)' : 'bitcoincash:... BCH address (legacy 1.../3... also accepted)'"
             />
+            <p class="hint" v-if="externalSendAddressResolution.error">{{ externalSendAddressResolution.error }}</p>
+            <p class="hint" v-else-if="externalSendAddressResolution.isLegacy && externalSendAddressResolution.address">Legacy address converted to: {{ externalSendAddressResolution.address }}</p>
           </div>
 
           <div class="row" v-if="sendMode === 'bch'">
@@ -3737,6 +3814,7 @@ onBeforeUnmount(() => {
               placeholder="0.00001"
               inputmode="decimal"
             />
+            <p class="hint">Available: {{ formatBchFromSats(bchBalance) }} BCH</p>
           </div>
 
           <div class="row" v-if="sendMode === 'bch'">
@@ -3756,16 +3834,15 @@ onBeforeUnmount(() => {
           <div class="row" v-else>
             <label for="send-modal-token-amount-input">Amount{{ selectedSendToken ? ` (${selectedSendToken.decimals} decimals)` : '' }}</label>
             <input id="send-modal-token-amount-input" v-model="sendTokenAmount" :placeholder="selectedSendToken?.decimals ? '1.0' : '1'" />
+            <p class="hint" v-if="selectedSendToken">
+              Available: {{ formatTokenAmount(selectedSendToken.fungibleAmount, selectedSendToken.decimals) }}{{ selectedSendToken.symbol ? ` ${selectedSendToken.symbol}` : '' }}
+            </p>
           </div>
 
-          <button @click="sendFunds" :disabled="isSendingFunds || (sendMode === 'token' && sendableTokens.length === 0) || (sendDestinationMode === 'wallet' && (isResolvingWalletAddress || !sendToAddress || !!sendToWalletError))">
+          <button @click="sendFunds" :disabled="isSendingFunds || (sendMode === 'token' && sendableTokens.length === 0) || (sendDestinationMode === 'wallet' && (isResolvingWalletAddress || !sendToAddress || !!sendToWalletError)) || (sendDestinationMode === 'external' && (!sendToAddress.trim() || !!externalSendAddressResolution.error))">
             <FontAwesomeIcon :icon="['fas', isSendingFunds ? 'rotate' : 'paper-plane']" class="icon-btn" />
             {{ isSendingFunds ? 'Sending...' : (sendMode === 'token' ? 'Send CashToken' : 'Send BCH') }}
           </button>
-
-          <p class="hint" v-if="sendMode === 'token' && selectedSendToken">
-            Available: {{ formatTokenAmount(selectedSendToken.fungibleAmount, selectedSendToken.decimals) }}{{ selectedSendToken.symbol ? ` ${selectedSendToken.symbol}` : '' }}
-          </p>
 
         </div>
 
