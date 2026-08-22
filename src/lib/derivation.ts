@@ -1,19 +1,20 @@
+import { type CoinTypeId, SLIP44_REGISTRY, findCoinEntryByType, getCoinType } from './coins';
+
 export type PresetDerivationPathType = 'standard' | 'bitcoindotcom' | 'zapit';
 export type DerivationPathType = PresetDerivationPathType | 'custom';
 
+function buildPreset(coinId: CoinTypeId, account = 0): { parent: string; full: string } {
+  const parent = `m/44'/${getCoinType(coinId)}'/${account}'`;
+  return { parent, full: `${parent}/0/0` };
+}
+
+// Presets are derived from the SLIP-44 registry (src/lib/coins.ts) instead
+// of hardcoding coin-type numbers here. To add/change a preset's coin type,
+// edit coins.ts - this map should never contain a raw number.
 export const DERIVATION_PATHS: Record<PresetDerivationPathType, { parent: string; full: string }> = {
-  standard: {
-    parent: "m/44'/145'/0'",
-    full: "m/44'/145'/0'/0/0",
-  },
-  bitcoindotcom: {
-    parent: "m/44'/0'/0'",
-    full: "m/44'/0'/0'/0/0",
-  },
-  zapit: {
-    parent: "m/44'/245'/0'",
-    full: "m/44'/245'/0'/0/0",
-  },
+  standard: buildPreset('BCH'),
+  bitcoindotcom: buildPreset('BTC'),
+  zapit: buildPreset('BCH_ZAPIT_LEGACY'),
 };
 
 export type DerivationCandidate = {
@@ -38,23 +39,9 @@ export type DerivationCandidate = {
   switchable: boolean;
 };
 
-type CoinTypeBase = {
-  /** Wallet(s)/ecosystem known to use this BIP44 coin type for BCH. */
-  label: string;
-  /** SLIP-44 coin type registered/used for this derivation scheme. */
-  coinType: number;
-};
-
-// Known BIP44 coin types that BCH wallets have derived from historically.
-// 145' is the official SLIP-44 registration for Bitcoin Cash. 0' and 245'
-// are legacy/alternate coin types some wallets used (either by reusing the
-// Bitcoin path, or via the older SLP/CashAddr-era Zapit convention), so a
-// "missing funds" scan needs to check all three.
-const KNOWN_COIN_TYPE_BASES: CoinTypeBase[] = [
-  { label: "Bitcoin Cash standard (SLIP-44 145')", coinType: 145 },
-  { label: "Bitcoin.com Wallet legacy (coin type 0')", coinType: 0 },
-  { label: "Zapit / SLP-era wallets (coin type 245')", coinType: 245 },
-];
+// Coin types that a "missing funds" scan checks. Sourced from the SLIP-44
+// registry - see coins.ts for why each of these is relevant to BCH.
+const SCAN_COIN_IDS: CoinTypeId[] = ['BCH', 'BTC', 'BCH_ZAPIT_LEGACY'];
 
 // How many account indexes (the third path level, e.g. .../0', .../1', ...)
 // to check per coin type. Covers the common case of a wallet having been
@@ -62,10 +49,11 @@ const KNOWN_COIN_TYPE_BASES: CoinTypeBase[] = [
 // wallet" feature, which historically lands on account 5/6 for BCH).
 const ACCOUNT_INDEXES_TO_SCAN = [0, 1, 2, 3, 4, 5, 6];
 
-function buildAccountCandidate(base: CoinTypeBase, account: number): DerivationCandidate {
-  const parent = `m/44'/${base.coinType}'/${account}'`;
+function buildAccountCandidate(coinId: CoinTypeId, account: number): DerivationCandidate {
+  const entry = SLIP44_REGISTRY[coinId];
+  const parent = `m/44'/${entry.coinType}'/${account}'`;
   return {
-    label: `${base.label} · account ${account}`,
+    label: `${entry.scanLabel} · account ${account}`,
     parent,
     full: `${parent}/0/0`,
     chain: 0,
@@ -97,10 +85,11 @@ const CHIP_PATHS_DRAFT_PURPOSES: ChipPathPurpose[] = [
   { chain: 7, index: 0, label: "WizardConnect/DeFi key (CHIP-Paths draft, .../7/0)" },
 ];
 
-function buildChipPathCandidate(base: CoinTypeBase, account: number, purpose: ChipPathPurpose): DerivationCandidate {
-  const parent = `m/44'/${base.coinType}'/${account}'`;
+function buildChipPathCandidate(coinId: CoinTypeId, account: number, purpose: ChipPathPurpose): DerivationCandidate {
+  const entry = SLIP44_REGISTRY[coinId];
+  const parent = `m/44'/${entry.coinType}'/${account}'`;
   return {
-    label: `${base.label} · account ${account} · ${purpose.label}`,
+    label: `${entry.scanLabel} · account ${account} · ${purpose.label}`,
     parent,
     full: `${parent}/${purpose.chain}/${purpose.index}`,
     chain: purpose.chain,
@@ -110,17 +99,98 @@ function buildChipPathCandidate(base: CoinTypeBase, account: number, purpose: Ch
 }
 
 export const DERIVATION_SCAN_CANDIDATES: DerivationCandidate[] = [
-  ...KNOWN_COIN_TYPE_BASES.flatMap((base) =>
-    ACCOUNT_INDEXES_TO_SCAN.map((account) => buildAccountCandidate(base, account)),
+  ...SCAN_COIN_IDS.flatMap((coinId) =>
+    ACCOUNT_INDEXES_TO_SCAN.map((account) => buildAccountCandidate(coinId, account)),
   ),
   // CHIP-Paths draft purpose branches, checked against the default account
   // (account 0) of the standard BCH coin type - the only combination any
   // known implementation currently derives them from.
-  ...CHIP_PATHS_DRAFT_PURPOSES.map((purpose) => buildChipPathCandidate(KNOWN_COIN_TYPE_BASES[0], 0, purpose)),
+  ...CHIP_PATHS_DRAFT_PURPOSES.map((purpose) => buildChipPathCandidate('BCH', 0, purpose)),
 ];
 
-const PARENT_DERIVATION_PATH_REGEX = /^m(\/\d+'?){3}$/;
-const FULL_DERIVATION_PATH_REGEX = /^m(\/\d+'?){3}\/0\/0$/;
+// --- Parsing & validation ------------------------------------------------
+
+export type DerivationParseErrorCode = 'MALFORMED_PATH' | 'UNKNOWN_COIN_TYPE' | 'ACCOUNT_NOT_HARDENED';
+
+export class DerivationParseError extends Error {
+  code: DerivationParseErrorCode;
+  constructor(code: DerivationParseErrorCode, message: string) {
+    super(message);
+    this.code = code;
+    this.name = 'DerivationParseError';
+  }
+}
+
+export interface ParsedDerivationPath {
+  purpose: number;
+  coinType: number;
+  account: number;
+  /** Present only when the input was a full path (includes chain/index). */
+  chain?: number;
+  index?: number;
+  isFull: boolean;
+}
+
+// m / purpose' / coinType' / account'  (levels 1-3 must be hardened per BIP44)
+const PARENT_PATTERN = /^m\/(\d+)'\/(\d+)'\/(\d+)'$/;
+// m / purpose' / coinType' / account' / chain / index  (chain/index NOT hardened)
+const FULL_PATTERN = /^m\/(\d+)'\/(\d+)'\/(\d+)'\/(\d+)\/(\d+)$/;
+
+/**
+ * Parse and validate a BIP44-style derivation path.
+ *
+ * Accepts either a parent (account-level) path or a full path with
+ * chain/index. Requires purpose/coin/account to be hardened, matching BIP44 -
+ * this is intentionally stricter than the old ad-hoc regexes, which accepted
+ * unhardened levels 1-3.
+ *
+ * Pass `knownCoinTypesOnly: true` to additionally reject coin types that
+ * aren't in the SLIP-44 registry (coins.ts). Off by default so power users
+ * can still enter a custom path for a coin type Purze doesn't have a preset
+ * for.
+ */
+export function parseDerivationPath(
+  path: string,
+  options: { knownCoinTypesOnly?: boolean } = {},
+): { ok: true; value: ParsedDerivationPath } | { ok: false; error: DerivationParseError } {
+  const trimmed = path.trim();
+
+  const fullMatch = trimmed.match(FULL_PATTERN);
+  const parentMatch = fullMatch ? null : trimmed.match(PARENT_PATTERN);
+  const match = fullMatch ?? parentMatch;
+
+  if (!match) {
+    return {
+      ok: false,
+      error: new DerivationParseError(
+        'MALFORMED_PATH',
+        `"${trimmed}" isn't a valid derivation path. Expected m/44'/<coin>'/<account>' or m/44'/<coin>'/<account>'/<chain>/<index>, with purpose/coin/account hardened (').`,
+      ),
+    };
+  }
+
+  const [, purposeStr, coinTypeStr, accountStr, chainStr, indexStr] = match;
+  const coinType = Number(coinTypeStr);
+
+  if (options.knownCoinTypesOnly && !findCoinEntryByType(coinType)) {
+    return {
+      ok: false,
+      error: new DerivationParseError('UNKNOWN_COIN_TYPE', `Coin type ${coinType}' isn't a recognized BCH derivation (see src/lib/coins.ts).`),
+    };
+  }
+
+  return {
+    ok: true,
+    value: {
+      purpose: Number(purposeStr),
+      coinType,
+      account: Number(accountStr),
+      chain: chainStr !== undefined ? Number(chainStr) : undefined,
+      index: indexStr !== undefined ? Number(indexStr) : undefined,
+      isFull: Boolean(fullMatch),
+    },
+  };
+}
 
 export function resolveDerivationPaths(derivationPath: DerivationPathType, customDerivationPath?: string) {
   if (derivationPath !== 'custom') {
@@ -130,19 +200,12 @@ export function resolveDerivationPaths(derivationPath: DerivationPathType, custo
   const trimmedCustomPath = customDerivationPath?.trim();
   if (!trimmedCustomPath) return null;
 
-  if (PARENT_DERIVATION_PATH_REGEX.test(trimmedCustomPath)) {
-    return {
-      parent: trimmedCustomPath,
-      full: `${trimmedCustomPath}/0/0`,
-    };
-  }
+  const parsed = parseDerivationPath(trimmedCustomPath);
+  if (!parsed.ok) return null;
 
-  if (FULL_DERIVATION_PATH_REGEX.test(trimmedCustomPath)) {
-    return {
-      parent: trimmedCustomPath.replace(/\/0\/0$/, ''),
-      full: trimmedCustomPath,
-    };
-  }
-
-  return null;
+  const parent = `m/${parsed.value.purpose}'/${parsed.value.coinType}'/${parsed.value.account}'`;
+  return {
+    parent,
+    full: parsed.value.isFull ? trimmedCustomPath : `${parent}/0/0`,
+  };
 }
