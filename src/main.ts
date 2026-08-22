@@ -26,6 +26,7 @@ import {
 	faBell,
 	faUser,
 	faMagnifyingGlass,
+	faChartPie,
 } from '@fortawesome/free-solid-svg-icons';
 
 library.add(
@@ -52,6 +53,7 @@ library.add(
 	faBell,
 	faUser,
 	faMagnifyingGlass,
+	faChartPie,
 );
 
 const app = createApp(App);

@@ -7,6 +7,7 @@ import { base58AddressToLockingBytecode, binToHex, encodeLockingBytecodeP2pkh, l
 import type { WcSignMessageRequest, WcSignTransactionRequest } from '@bch-wc2/interfaces';
 import { DERIVATION_PATHS, DERIVATION_SCAN_CANDIDATES, type DerivationPathType, resolveDerivationPaths } from './lib/derivation';
 import UiSelect from './components/UiSelect.vue';
+import WalletAllocationChart, { type AllocationEntry } from './components/WalletAllocationChart.vue';
 
 type WalletKind = 'single' | 'hd';
 type SessionMap = Record<string, {
@@ -173,7 +174,7 @@ type AssetItem = {
 };
 
 type MobilePanel = 'wallet' | 'tokens' | 'manager' | 'walletconnect';
-type OverlayScreen = 'none' | 'wallet-list' | 'token-list' | 'send-asset' | 'wallet-connect' | 'manage-wallet' | 'create-import' | 'about' | 'receive' | 'notifications';
+type OverlayScreen = 'none' | 'wallet-list' | 'token-list' | 'send-asset' | 'wallet-connect' | 'manage-wallet' | 'create-import' | 'about' | 'receive' | 'notifications' | 'allocation-chart';
 
 const WALLETCONNECT_PROJECT_ID = '3fd234b8e2cd0e1da4bc08a0011bbf64';
 const TOKEN_NAME_CACHE_STORAGE_KEY = 'slim.tokenNameCache.v2';
@@ -504,6 +505,71 @@ const assetItems = computed<AssetItem[]>(() => {
   return [bchAsset, ...tokenAssets];
 });
 const previewAssets = computed(() => assetItems.value.slice(0, 100));
+
+// --- Fund allocation chart (active wallet only) ---------------------------
+// Built purely from this wallet's own reactive state (bchBalance,
+// visibleTokenList) - never touches `wallets`/`walletBalances` for other
+// wallets, so switching wallets or hiding a token is reflected automatically
+// and nothing here can leak another wallet's holdings into the chart.
+type AllocationSourceEntry = {
+  key: string;
+  label: string;
+  amountText: string;
+  valueText: string | null;
+  /** Decimal-adjusted raw amount, used for slice sizing when not every asset has a fiat value. */
+  amountWeight: number;
+  /** Fiat value, used for slice sizing only when every included asset has one. */
+  valueWeight: number | null;
+};
+
+const walletAllocationSourceEntries = computed<AllocationSourceEntry[]>(() => {
+  if (!activeWallet.value) return [];
+  const entries: AllocationSourceEntry[] = [];
+
+  if (bchBalance.value > 0n) {
+    entries.push({
+      key: 'alloc-bch',
+      label: 'Bitcoin Cash (BCH)',
+      amountText: `${formatBchFromSats(bchBalance.value)} BCH`,
+      valueText: fiatBalance.value !== null ? formatCurrency(fiatBalance.value) : null,
+      amountWeight: Number(bchBalance.value) / 1e8,
+      valueWeight: fiatBalance.value,
+    });
+  }
+
+  for (const token of visibleTokenList.value) {
+    if (token.fungibleAmount <= 0n) continue; // NFT-only or empty balance - nothing to size a slice by
+    entries.push({
+      key: `alloc-${token.category}`,
+      label: token.symbol ? `${token.displayName} (${token.symbol})` : token.displayName,
+      amountText: formatTokenAmount(token.fungibleAmount, token.decimals),
+      valueText: null, // Purze doesn't currently price individual tokens in fiat
+      amountWeight: Number(token.fungibleAmount) / 10 ** (token.decimals ?? 0),
+      valueWeight: null,
+    });
+  }
+
+  return entries;
+});
+
+// Only size slices by fiat value when every included asset actually has one -
+// otherwise a token's raw unit count would get compared against BCH's dollar
+// value, which isn't a fair "allocation" in any real sense.
+const walletAllocationUsesValueWeighting = computed(
+  () =>
+    walletAllocationSourceEntries.value.length > 0 &&
+    walletAllocationSourceEntries.value.every((entry) => entry.valueWeight !== null && entry.valueWeight > 0),
+);
+
+const walletAllocationEntries = computed<AllocationEntry[]>(() =>
+  walletAllocationSourceEntries.value.map((entry) => ({
+    key: entry.key,
+    label: entry.label,
+    amountText: entry.amountText,
+    valueText: entry.valueText,
+    weight: walletAllocationUsesValueWeighting.value ? (entry.valueWeight as number) : entry.amountWeight,
+  })),
+);
 const currentWalletButtonLabel = computed(() => activeWalletName.value || 'Select Wallet');
 const pendingWcApproval = computed(() => pendingWcRequests.value[0] ?? null);
 const pendingWcConnectionProposal = computed(() => pendingWcConnectionProposals.value[0] ?? null);
@@ -762,6 +828,16 @@ function openTokenListModal() {
   activeOverlayScreen.value = 'token-list';
   if (tokenList.value.length > 0) {
     void hydrateTokenNames(tokenList.value);
+  }
+}
+
+function openAllocationChartModal() {
+  activeOverlayScreen.value = 'allocation-chart';
+}
+
+function closeAllocationChartModal() {
+  if (activeOverlayScreen.value === 'allocation-chart') {
+    activeOverlayScreen.value = 'none';
   }
 }
 
@@ -3114,6 +3190,9 @@ onBeforeUnmount(() => {
           </div>
           <div class="tokens-preview-head-right">
             <span class="tokens-preview-usd">{{ formatCurrency(fiatBalance) }}</span>
+            <button class="tiny-btn" @click="openAllocationChartModal" :disabled="assetItems.length === 0" title="Fund allocation" aria-label="Show fund allocation chart">
+              <FontAwesomeIcon :icon="['fas', 'chart-pie']" class="icon-btn" />
+            </button>
             <button class="tiny-btn" @click="openTokenListModal" :disabled="assetItems.length === 0">View all</button>
           </div>
         </div>
@@ -3696,6 +3775,30 @@ onBeforeUnmount(() => {
               </article>
             </div>
           </div>
+        </div>
+      </dialog>
+    </div>
+
+    <div v-if="activeOverlayScreen === 'allocation-chart'" class="action-sheet-overlay" @click.self="closeAllocationChartModal">
+      <dialog class="action-sheet allocation-chart-modal" open aria-label="Fund allocation">
+        <div class="action-sheet-header">
+          <div class="action-sheet-title-wrap">
+            <strong class="action-sheet-title">Fund Allocation</strong>
+            <span class="action-sheet-subtitle">{{ activeWalletName || 'Active wallet' }}</span>
+          </div>
+          <button class="icon-close" @click="closeAllocationChartModal" aria-label="Close fund allocation">
+            <FontAwesomeIcon :icon="['fas', 'xmark']" />
+          </button>
+        </div>
+
+        <div class="manage-wallet-info">
+          <p class="hint" v-if="!activeWallet">Select a wallet to see its fund allocation.</p>
+          <WalletAllocationChart
+            v-else
+            :wallet-name="activeWalletName || 'this wallet'"
+            :entries="walletAllocationEntries"
+            :value-weighted="walletAllocationUsesValueWeighting"
+          />
         </div>
       </dialog>
     </div>
